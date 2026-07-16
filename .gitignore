@@ -5,3 +5,5 @@ node_modules/
 .DS_Store
 *.log
 coverage/
+src/index.ts
+public/app.js
