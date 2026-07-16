@@ -1,0 +1,180 @@
+    env.DB.prepare(`
+      SELECT c.id, c.name, c.subject, c.status, c.created_at,
+        COUNT(cr.id) AS recipients,
+        SUM(CASE WHEN cr.status = 'sent' THEN 1 ELSE 0 END) AS sent,
+        SUM(CASE WHEN cr.status = 'failed' THEN 1 ELSE 0 END) AS failed
+      FROM campaigns c
+      LEFT JOIN campaign_recipients cr ON cr.campaign_id = c.id
+      GROUP BY c.id
+      ORDER BY c.created_at DESC
+      LIMIT 5
+    `).all()
+  ]);
+
+  return json({
+    counts: {
+      audiences: Number(audiences?.count ?? 0),
+      contacts: Number(contacts?.count ?? 0),
+      campaigns: Number(campaigns?.count ?? 0),
+      sent: Number(sent?.count ?? 0),
+      suppressed: Number(suppressed?.count ?? 0)
+    },
+    recentCampaigns: recent.results
+  });
+}
+
+async function listAudiences(env: Env): Promise<Response> {
+  const result = await env.DB.prepare(`
+    SELECT a.*, COUNT(c.id) AS contact_count,
+      SUM(CASE WHEN c.status = 'active' THEN 1 ELSE 0 END) AS active_count
+    FROM audiences a
+    LEFT JOIN contacts c ON c.audience_id = a.id
+    GROUP BY a.id
+    ORDER BY a.name COLLATE NOCASE
+  `).all();
+  return json(result.results);
+}
+
+async function createAudience(request: Request, env: Env): Promise<Response> {
+  const body = await readJson(request);
+  const id = crypto.randomUUID();
+  const name = requiredString(body.name, "Audience name", 120);
+  const description = optionalString(body.description, 1000);
+  const color = safeColor(body.color, "#16b8a6");
+  await env.DB.prepare("INSERT INTO audiences (id, name, description, color) VALUES (?, ?, ?, ?)")
+    .bind(id, name, description, color).run();
+  return json({ id, name, description, color }, 201);
+}
+
+async function updateAudience(request: Request, env: Env, id: string): Promise<Response> {
+  const existing = await env.DB.prepare("SELECT * FROM audiences WHERE id = ?").bind(id).first<Row>();
+  if (!existing) throw new HttpError(404, "Audience not found.");
+  const body = await readJson(request);
+  const name = body.name === undefined ? String(existing.name) : requiredString(body.name, "Audience name", 120);
+  const description = body.description === undefined ? String(existing.description) : optionalString(body.description, 1000);
+  const color = body.color === undefined ? String(existing.color) : safeColor(body.color, String(existing.color));
+  await env.DB.prepare("UPDATE audiences SET name = ?, description = ?, color = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(name, description, color, id).run();
+  return json({ id, name, description, color });
+}
+
+async function deleteAudience(env: Env, id: string): Promise<Response> {
+  const used = await env.DB.prepare("SELECT COUNT(*) AS count FROM campaigns WHERE audience_id = ?").bind(id).first<{ count: number }>();
+  if (Number(used?.count ?? 0) > 0) throw new HttpError(409, "This audience is used by a campaign and cannot be deleted.");
+  const result = await env.DB.prepare("DELETE FROM audiences WHERE id = ?").bind(id).run();
+  if (!result.meta.changes) throw new HttpError(404, "Audience not found.");
+  return json({ ok: true });
+}
+
+async function listContacts(env: Env, url: URL): Promise<Response> {
+  const audienceId = url.searchParams.get("audience_id") ?? "";
+  const search = (url.searchParams.get("search") ?? "").trim();
+  const tagId = url.searchParams.get("tag_id") ?? "";
+  const status = url.searchParams.get("status") ?? "";
+  const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));
+  const pageSize = Math.min(100, Math.max(10, Number(url.searchParams.get("page_size") ?? 50)));
+  const offset = (page - 1) * pageSize;
+
+  const clauses: string[] = ["1 = 1"];
+  const bindings: unknown[] = [];
+  if (audienceId) { clauses.push("c.audience_id = ?"); bindings.push(audienceId); }
+  if (status) { clauses.push("c.status = ?"); bindings.push(status); }
+  if (search) {
+    clauses.push("(c.email LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ? OR c.company LIKE ? OR c.country LIKE ?)");
+    const needle = `%${search.slice(0, 50)}%`;
+    bindings.push(needle, needle, needle, needle, needle);
+  }
+  if (tagId) {
+    clauses.push("EXISTS (SELECT 1 FROM contact_tags ct2 WHERE ct2.contact_id = c.id AND ct2.tag_id = ?)");
+    bindings.push(tagId);
+  }
+
+  const where = clauses.join(" AND ");
+  const [rows, count] = await Promise.all([
+    env.DB.prepare(`
+      SELECT c.*, a.name AS audience_name,
+        COALESCE(GROUP_CONCAT(t.name, ', '), '') AS tags,
+        COALESCE(GROUP_CONCAT(t.id, ','), '') AS tag_ids
+      FROM contacts c
+      JOIN audiences a ON a.id = c.audience_id
+      LEFT JOIN contact_tags ct ON ct.contact_id = c.id
+      LEFT JOIN tags t ON t.id = ct.tag_id
+      WHERE ${where}
+      GROUP BY c.id
+      ORDER BY c.created_at DESC
+      LIMIT ? OFFSET ?
+    `).bind(...bindings, pageSize, offset).all(),
+    env.DB.prepare(`SELECT COUNT(*) AS count FROM contacts c WHERE ${where}`).bind(...bindings).first<{ count: number }>()
+  ]);
+
+  return json({ rows: rows.results, total: Number(count?.count ?? 0), page, pageSize });
+}
+
+async function createContact(request: Request, env: Env): Promise<Response> {
+  const body = await readJson(request);
+  const id = crypto.randomUUID();
+  const contact = normalizeContact(body);
+  await env.DB.prepare(`
+    INSERT INTO contacts (id, audience_id, email, first_name, last_name, company, job_title, country, phone, custom_json, status, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual')
+  `).bind(id, contact.audienceId, contact.email, contact.firstName, contact.lastName, contact.company, contact.jobTitle,
+    contact.country, contact.phone, JSON.stringify(contact.custom), contact.status).run();
+  await replaceContactTags(env, id, arrayOfStrings(body.tagIds));
+  return json({ id, ...contact }, 201);
+}
+
+async function updateContact(request: Request, env: Env, id: string): Promise<Response> {
+  const existing = await env.DB.prepare("SELECT * FROM contacts WHERE id = ?").bind(id).first<Row>();
+  if (!existing) throw new HttpError(404, "Contact not found.");
+  const body = await readJson(request);
+  const merged = { ...existing, ...body, audienceId: body.audienceId ?? existing.audience_id };
+  const contact = normalizeContact(merged);
+  await env.DB.prepare(`
+    UPDATE contacts SET audience_id = ?, email = ?, first_name = ?, last_name = ?, company = ?, job_title = ?,
+      country = ?, phone = ?, custom_json = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+  `).bind(contact.audienceId, contact.email, contact.firstName, contact.lastName, contact.company, contact.jobTitle,
+    contact.country, contact.phone, JSON.stringify(contact.custom), contact.status, id).run();
+  if (body.tagIds !== undefined) await replaceContactTags(env, id, arrayOfStrings(body.tagIds));
+  return json({ id, ...contact });
+}
+
+async function deleteContact(env: Env, id: string): Promise<Response> {
+  const result = await env.DB.prepare("DELETE FROM contacts WHERE id = ?").bind(id).run();
+  if (!result.meta.changes) throw new HttpError(404, "Contact not found.");
+  return json({ ok: true });
+}
+
+async function exportContacts(env: Env, url: URL): Promise<Response> {
+  const audienceId = url.searchParams.get("audience_id");
+  if (!audienceId) throw new HttpError(400, "audience_id is required.");
+  const audience = await env.DB.prepare("SELECT name FROM audiences WHERE id = ?").bind(audienceId).first<{ name: string }>();
+  if (!audience) throw new HttpError(404, "Audience not found.");
+  const result = await env.DB.prepare(`
+    SELECT email, first_name, last_name, company, job_title, country, phone, status
+    FROM contacts WHERE audience_id = ? ORDER BY email
+  `).bind(audienceId).all();
+  const columns = ["email", "first_name", "last_name", "company", "job_title", "country", "phone", "status"];
+  const lines = [columns.join(",")];
+  for (const row of result.results as Row[]) {
+    lines.push(columns.map((key) => csvCell(row[key])).join(","));
+  }
+  return new Response(lines.join("\r\n"), {
+    headers: {
+      "content-type": "text/csv; charset=utf-8",
+      "content-disposition": `attachment; filename="${slugify(audience.name)}-contacts.csv"`
+    }
+  });
+}
+
+async function previewImport(request: Request, env: Env): Promise<Response> {
+  const form = await request.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) throw new HttpError(400, "Choose a CSV, XLS, or XLSX file.");
+  const rows = await parseSpreadsheet(file, Math.min(25, maxImportRows(env)));
+  if (!rows.length) throw new HttpError(400, "No data rows were found.");
+  const columns = Object.keys(rows[0]);
+  return json({
+    filename: file.name,
+    columns,
+    sample: rows.slice(0, 10),
+    suggestedMapping: suggestMapping(columns)
