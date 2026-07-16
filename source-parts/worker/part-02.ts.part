@@ -1,0 +1,180 @@
+  });
+}
+
+async function commitImport(request: Request, env: Env): Promise<Response> {
+  const form = await request.formData();
+  const file = form.get("file");
+  const audienceId = String(form.get("audienceId") ?? "");
+  const mapping = parseJsonObject(String(form.get("mapping") ?? "{}"));
+  const tagIds = parseJsonArray(String(form.get("tagIds") ?? "[]")).map(String);
+  if (!(file instanceof File)) throw new HttpError(400, "Choose a CSV, XLS, or XLSX file.");
+  if (!audienceId) throw new HttpError(400, "Choose an audience.");
+  if (!mapping.email) throw new HttpError(400, "Map an email column before importing.");
+  const audience = await env.DB.prepare("SELECT id FROM audiences WHERE id = ?").bind(audienceId).first();
+  if (!audience) throw new HttpError(404, "Audience not found.");
+
+  const limit = maxImportRows(env);
+  const rows = await parseSpreadsheet(file, limit + 1);
+  if (rows.length > limit) throw new HttpError(413, `This import exceeds the ${limit.toLocaleString()} row limit.`);
+
+  const importId = crypto.randomUUID();
+  const importSource = `import:${importId}`;
+  let rejected = 0;
+  let accepted = 0;
+  const statements: D1PreparedStatement[] = [];
+  const insert = env.DB.prepare(`
+    INSERT INTO contacts (id, audience_id, email, first_name, last_name, company, job_title, country, phone, custom_json, status, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+    ON CONFLICT(audience_id, email) DO UPDATE SET
+      first_name = CASE WHEN excluded.first_name <> '' THEN excluded.first_name ELSE contacts.first_name END,
+      last_name = CASE WHEN excluded.last_name <> '' THEN excluded.last_name ELSE contacts.last_name END,
+      company = CASE WHEN excluded.company <> '' THEN excluded.company ELSE contacts.company END,
+      job_title = CASE WHEN excluded.job_title <> '' THEN excluded.job_title ELSE contacts.job_title END,
+      country = CASE WHEN excluded.country <> '' THEN excluded.country ELSE contacts.country END,
+      phone = CASE WHEN excluded.phone <> '' THEN excluded.phone ELSE contacts.phone END,
+      custom_json = excluded.custom_json,
+      source = excluded.source,
+      updated_at = CURRENT_TIMESTAMP
+  `);
+
+  for (const row of rows) {
+    const email = normalizeEmail(valueAt(row, mapping.email));
+    if (!email) { rejected += 1; continue; }
+    const id = crypto.randomUUID();
+    const knownColumns = new Set(Object.values(mapping).filter(Boolean).map(String));
+    const custom: Row = {};
+    for (const [key, value] of Object.entries(row)) {
+      if (!knownColumns.has(key) && value !== "" && value !== null && value !== undefined) custom[key] = value;
+    }
+    statements.push(insert.bind(
+      id,
+      audienceId,
+      email,
+      cleanCell(valueAt(row, mapping.firstName), 120),
+      cleanCell(valueAt(row, mapping.lastName), 120),
+      cleanCell(valueAt(row, mapping.company), 200),
+      cleanCell(valueAt(row, mapping.jobTitle), 200),
+      cleanCell(valueAt(row, mapping.country), 100),
+      cleanCell(valueAt(row, mapping.phone), 80),
+      JSON.stringify(custom),
+      importSource
+    ));
+    accepted += 1;
+  }
+
+  for (let index = 0; index < statements.length; index += 100) {
+    await env.DB.batch(statements.slice(index, index + 100));
+  }
+
+  if (tagIds.length && accepted) {
+    const contacts = await env.DB.prepare("SELECT id FROM contacts WHERE audience_id = ? AND source = ?")
+      .bind(audienceId, importSource).all<{ id: string }>();
+    const tagInsert = env.DB.prepare("INSERT OR IGNORE INTO contact_tags (contact_id, tag_id) VALUES (?, ?)");
+    const tagStatements: D1PreparedStatement[] = [];
+    for (const contact of contacts.results) {
+      for (const tagId of tagIds.slice(0, 20)) tagStatements.push(tagInsert.bind(contact.id, tagId));
+    }
+    for (let index = 0; index < tagStatements.length; index += 100) {
+      await env.DB.batch(tagStatements.slice(index, index + 100));
+    }
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO imports (id, audience_id, filename, rows_seen, rows_imported, rows_rejected, mapping_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).bind(importId, audienceId, file.name.slice(0, 200), rows.length, accepted, rejected, JSON.stringify(mapping)).run();
+
+  return json({ id: importId, rowsSeen: rows.length, rowsImported: accepted, rowsRejected: rejected }, 201);
+}
+
+async function listTags(env: Env): Promise<Response> {
+  const result = await env.DB.prepare(`
+    SELECT t.*, COUNT(ct.contact_id) AS contact_count
+    FROM tags t LEFT JOIN contact_tags ct ON ct.tag_id = t.id
+    GROUP BY t.id ORDER BY t.name COLLATE NOCASE
+  `).all();
+  return json(result.results);
+}
+
+async function createTag(request: Request, env: Env): Promise<Response> {
+  const body = await readJson(request);
+  const id = crypto.randomUUID();
+  const name = requiredString(body.name, "Tag name", 80);
+  const color = safeColor(body.color, "#64748b");
+  await env.DB.prepare("INSERT INTO tags (id, name, color) VALUES (?, ?, ?)").bind(id, name, color).run();
+  return json({ id, name, color }, 201);
+}
+
+async function deleteTag(env: Env, id: string): Promise<Response> {
+  const result = await env.DB.prepare("DELETE FROM tags WHERE id = ?").bind(id).run();
+  if (!result.meta.changes) throw new HttpError(404, "Tag not found.");
+  return json({ ok: true });
+}
+
+async function listSenders(env: Env): Promise<Response> {
+  const result = await env.DB.prepare("SELECT * FROM sender_identities ORDER BY is_default DESC, name COLLATE NOCASE").all();
+  return json(result.results);
+}
+
+async function createSender(request: Request, env: Env): Promise<Response> {
+  const body = await readJson(request);
+  const id = crypto.randomUUID();
+  const name = requiredString(body.name, "Sender name", 120);
+  const email = requiredEmail(body.email, "Sender email");
+  const replyTo = body.replyTo ? requiredEmail(body.replyTo, "Reply-to email") : "";
+  const status = enumValue(body.status, ["pending", "ready", "disabled"], "pending");
+  const isDefault = Boolean(body.isDefault) ? 1 : 0;
+  if (isDefault) await env.DB.prepare("UPDATE sender_identities SET is_default = 0").run();
+  await env.DB.prepare(`
+    INSERT INTO sender_identities (id, name, email, reply_to, status, is_default) VALUES (?, ?, ?, ?, ?, ?)
+  `).bind(id, name, email, replyTo, status, isDefault).run();
+  return json({ id, name, email, replyTo, status, isDefault }, 201);
+}
+
+async function updateSender(request: Request, env: Env, id: string): Promise<Response> {
+  const existing = await env.DB.prepare("SELECT * FROM sender_identities WHERE id = ?").bind(id).first<Row>();
+  if (!existing) throw new HttpError(404, "Sender identity not found.");
+  const body = await readJson(request);
+  const name = body.name === undefined ? String(existing.name) : requiredString(body.name, "Sender name", 120);
+  const email = body.email === undefined ? String(existing.email) : requiredEmail(body.email, "Sender email");
+  const replyTo = body.replyTo === undefined ? String(existing.reply_to) : (body.replyTo ? requiredEmail(body.replyTo, "Reply-to email") : "");
+  const status = body.status === undefined ? String(existing.status) : enumValue(body.status, ["pending", "ready", "disabled"], "pending");
+  const isDefault = body.isDefault === undefined ? Number(existing.is_default) : (Boolean(body.isDefault) ? 1 : 0);
+  if (isDefault) await env.DB.prepare("UPDATE sender_identities SET is_default = 0 WHERE id <> ?").bind(id).run();
+  await env.DB.prepare(`
+    UPDATE sender_identities SET name = ?, email = ?, reply_to = ?, status = ?, is_default = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+  `).bind(name, email, replyTo, status, isDefault, id).run();
+  return json({ id, name, email, replyTo, status, isDefault });
+}
+
+async function deleteSender(env: Env, id: string): Promise<Response> {
+  const used = await env.DB.prepare("SELECT COUNT(*) AS count FROM campaigns WHERE sender_id = ?").bind(id).first<{ count: number }>();
+  if (Number(used?.count ?? 0) > 0) throw new HttpError(409, "This sender is used by a campaign and cannot be deleted.");
+  const result = await env.DB.prepare("DELETE FROM sender_identities WHERE id = ?").bind(id).run();
+  if (!result.meta.changes) throw new HttpError(404, "Sender identity not found.");
+  return json({ ok: true });
+}
+
+async function listCampaigns(env: Env): Promise<Response> {
+  const result = await env.DB.prepare(`
+    SELECT c.*, a.name AS audience_name, s.name AS sender_name, s.email AS sender_email,
+      COUNT(cr.id) AS recipients,
+      SUM(CASE WHEN cr.status = 'sent' THEN 1 ELSE 0 END) AS sent,
+      SUM(CASE WHEN cr.status = 'failed' THEN 1 ELSE 0 END) AS failed,
+      SUM(CASE WHEN cr.status = 'suppressed' THEN 1 ELSE 0 END) AS suppressed
+    FROM campaigns c
+    JOIN audiences a ON a.id = c.audience_id
+    JOIN sender_identities s ON s.id = c.sender_id
+    LEFT JOIN campaign_recipients cr ON cr.campaign_id = c.id
+    GROUP BY c.id
+    ORDER BY c.created_at DESC
+  `).all();
+  return json(result.results);
+}
+
+async function getCampaign(env: Env, id: string): Promise<Response> {
+  const campaign = await env.DB.prepare(`
+    SELECT c.*, a.name AS audience_name, s.name AS sender_name, s.email AS sender_email
+    FROM campaigns c JOIN audiences a ON a.id = c.audience_id JOIN sender_identities s ON s.id = c.sender_id
+    WHERE c.id = ?
+  `).bind(id).first<Row>();
