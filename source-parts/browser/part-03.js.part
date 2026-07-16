@@ -1,0 +1,88 @@
+async function deleteSuppression(encodedEmail) {
+  const email = decodeURIComponent(encodedEmail);
+  if (!confirm(`Remove ${email} from the suppression list? This may make it sendable again.`)) return;
+  await api(`/api/suppressions/${encodeURIComponent(email)}`, { method: 'DELETE' }); await renderCurrent();
+}
+
+function openModal({ title, subtitle = '', body, footer, large = false }) {
+  modal.className = `modal${large ? ' large' : ''}`;
+  modal.innerHTML = `<header class="modal-header"><div><h2 id="modalTitle">${esc(title)}</h2>${subtitle ? `<p>${esc(subtitle)}</p>` : ''}</div><button class="close-modal" data-action="close-modal" aria-label="Close">×</button></header><div class="modal-body">${body}</div><footer class="modal-footer">${footer}</footer>`;
+  modalBackdrop.hidden = false;
+  document.body.style.overflow = 'hidden';
+}
+
+function closeModal() {
+  modalBackdrop.hidden = true; modal.innerHTML = ''; document.body.style.overflow = '';
+}
+
+async function api(path, { method = 'GET', body, rawBody = false } = {}) {
+  const options = { method, headers: { 'Accept': 'application/json' } };
+  if (body !== undefined) {
+    if (rawBody) options.body = body;
+    else { options.headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(body); }
+  }
+  const response = await fetch(path, options);
+  const contentType = response.headers.get('content-type') || '';
+  const payload = contentType.includes('application/json') ? await response.json() : await response.text();
+  if (!response.ok) throw new Error(payload?.error || payload || `Request failed (${response.status})`);
+  return payload;
+}
+
+function audienceCard(item) {
+  return `<article class="entity-card"><div class="entity-card-top"><div><span class="color-chip" style="background:${esc(item.color)}"></span><h3 style="display:inline;margin-left:10px">${esc(item.name)}</h3></div><button class="icon-button" data-action="edit-audience" data-id="${esc(item.id)}">✎</button></div><p>${esc(item.description || 'No description yet.')}</p><div class="entity-card-footer"><div><strong>${fmt(item.active_count || 0)}</strong><small>active contacts</small></div><div class="section-actions"><button class="button small ghost" data-action="view-audience" data-id="${esc(item.id)}">Open</button><button class="button small danger" data-action="delete-audience" data-id="${esc(item.id)}">Delete</button></div></div></article>`;
+}
+
+function tagCard(item) {
+  return `<span class="badge" style="border-color:${esc(item.color)}55"><span class="color-chip" style="background:${esc(item.color)}"></span>${esc(item.name)} · ${fmt(item.contact_count || 0)}<button class="icon-button" style="width:22px;height:22px;border:0;background:transparent" data-action="delete-tag" data-id="${esc(item.id)}">×</button></span>`;
+}
+
+function contactRow(item) {
+  return `<tr data-row="${encodeURIComponent(JSON.stringify(item))}"><td><div class="cell-primary">${esc([item.first_name,item.last_name].filter(Boolean).join(' ') || item.email)}</div><div class="cell-secondary">${esc(item.email)}</div></td><td><div class="cell-primary">${esc(item.company || '—')}</div><div class="cell-secondary">${esc(item.job_title || '')}</div></td><td>${esc(item.audience_name)}</td><td>${esc(item.country || '—')}</td><td>${item.tags ? item.tags.split(', ').map(tag => `<span class="badge">${esc(tag)}</span>`).join(' ') : '—'}</td><td>${statusBadge(item.status)}</td><td><div class="table-actions"><button class="button small ghost" data-action="edit-contact" data-id="${esc(item.id)}">Edit</button><button class="button small danger" data-action="delete-contact" data-id="${esc(item.id)}">Delete</button></div></td></tr>`;
+}
+
+function campaignCard(item) {
+  const recipients = Number(item.recipients || 0); const sent = Number(item.sent || 0); const failed = Number(item.failed || 0); const suppressed = Number(item.suppressed || 0);
+  const progress = recipients ? Math.round((sent + failed + suppressed) / recipients * 100) : 0;
+  const editable = ['draft','scheduled','paused'].includes(item.status);
+  return `<article class="entity-card"><div class="entity-card-top"><div><h3>${esc(item.name)}</h3><div class="cell-secondary">${esc(item.audience_name)} · ${esc(item.sender_name)}</div></div>${statusBadge(item.status)}</div><p class="cell-primary" style="min-height:42px">${esc(item.subject)}</p><div class="progress"><span style="width:${progress}%"></span></div><div class="metric-row"><div class="metric"><small>Recipients</small><strong>${fmt(recipients)}</strong></div><div class="metric"><small>Sent</small><strong>${fmt(sent)}</strong></div><div class="metric"><small>Failed</small><strong>${fmt(failed)}</strong></div><div class="metric"><small>Suppressed</small><strong>${fmt(suppressed)}</strong></div></div><div class="entity-card-footer"><small>${item.scheduled_at ? `Scheduled ${fmtDate(item.scheduled_at)}` : `Created ${fmtDate(item.created_at)}`}</small><div class="section-actions">${editable ? `<button class="button small ghost" data-action="edit-campaign" data-id="${esc(item.id)}">Edit</button>` : ''}${['draft','scheduled','paused'].includes(item.status) ? `<button class="button small primary" data-action="launch-campaign" data-id="${esc(item.id)}">${item.status === 'paused' ? 'Resume' : 'Launch'}</button>` : ''}${['queued','sending','scheduled'].includes(item.status) ? `<button class="button small ghost" data-action="pause-campaign" data-id="${esc(item.id)}">Pause</button>` : ''}${item.status === 'draft' ? `<button class="button small danger" data-action="delete-campaign" data-id="${esc(item.id)}">Delete</button>` : ''}</div></div></article>`;
+}
+
+function campaignRow(item) {
+  return `<tr><td><div class="cell-primary">${esc(item.name)}</div><div class="cell-secondary">${esc(item.subject)}</div></td><td>${statusBadge(item.status)}</td><td>${fmt(item.recipients || 0)}</td><td>${fmt(item.sent || 0)}</td><td>${fmt(item.failed || 0)}</td><td>${fmtDate(item.created_at)}</td></tr>`;
+}
+
+function senderRow(item) {
+  return `<tr><td><div class="cell-primary">${esc(item.name)} ${item.is_default ? '<span class="badge success">Default</span>' : ''}</div></td><td>${esc(item.email)}</td><td>${esc(item.reply_to || 'Same as From')}</td><td>${statusBadge(item.status)}</td><td><div class="table-actions"><button class="button small ghost" data-action="edit-sender" data-id="${esc(item.id)}">Edit</button><button class="button small danger" data-action="delete-sender" data-id="${esc(item.id)}">Delete</button></div></td></tr>`;
+}
+
+function suppressionRow(item) {
+  return `<tr><td class="cell-primary">${esc(item.email)}</td><td>${esc(item.reason)}</td><td>${esc(item.source)}</td><td>${fmtDate(item.created_at)}</td><td><div class="table-actions"><button class="button small danger" data-action="delete-suppression" data-id="${encodeURIComponent(item.email)}">Remove</button></div></td></tr>`;
+}
+
+function statCard(label, value, detail) { return `<article class="stat-card"><label>${esc(label)}</label><strong>${fmt(value)}</strong><small>${esc(detail)}</small></article>`; }
+function checkItem(label, done) { return `<div style="display:flex;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)"><span style="color:${done ? 'var(--success)' : 'var(--warning)'}">${done ? '✓' : '○'}</span><span style="font-size:12px;color:${done ? 'var(--text)' : 'var(--muted)'}">${esc(label)}</span></div>`; }
+function statusBadge(status) { return `<span class="badge ${esc(status)}"><span class="dot"></span>${esc(status)}</span>`; }
+function emptyState(icon, heading, text, action, label) { return `<div class="panel" style="grid-column:1/-1"><div class="empty-state"><div class="empty-icon">${icon}</div><h3>${esc(heading)}</h3><p>${esc(text)}</p><button class="button primary" data-action="${esc(action)}">＋ ${esc(label)}</button></div></div>`; }
+function emptyTableRow(span, text) { return `<tr><td colspan="${span}"><div class="empty-state" style="padding:35px"><p>${esc(text)}</p></div></td></tr>`; }
+function loading() { return `<div class="loading-state"><span class="spinner"></span><p>Loading…</p></div>`; }
+function errorState(error) { return `<div class="panel"><div class="empty-state"><div class="empty-icon">!</div><h3>Could not load this view</h3><p>${esc(error.message || error)}</p><button class="button primary" data-action="refresh">Try again</button></div></div>`; }
+
+function options(items, selected = '') { return items.map(item => `<option value="${esc(item.id)}" ${item.id === selected ? 'selected' : ''}>${esc(item.name)}</option>`).join(''); }
+function statusOptions(selected, items) { return items.map(item => `<option value="${item}" ${item === selected ? 'selected' : ''}>${item.charAt(0).toUpperCase()+item.slice(1)}</option>`).join(''); }
+function tagCheckboxes(selected = new Set(), name = 'tagIds') { return state.tags.length ? state.tags.map(tag => `<label class="checkbox-pill"><input type="checkbox" name="${name}" value="${esc(tag.id)}" ${selected.has(tag.id) ? 'checked' : ''}><span>${esc(tag.name)}</span></label>`).join('') : '<span class="cell-secondary">No tags yet.</span>'; }
+
+function mappingFields(columns, mapping) {
+  const fields = [['email','Email address *'],['firstName','First name'],['lastName','Last name'],['company','Company'],['jobTitle','Job title'],['country','Country'],['phone','Phone']];
+  return fields.map(([key,label]) => `<label class="field"><span>${label}</span><select data-map-field="${key}"><option value="">Do not import</option>${columns.map(column => `<option value="${esc(column)}" ${mapping[key] === column ? 'selected' : ''}>${esc(column)}</option>`).join('')}</select></label>`).join('');
+}
+function sampleTable(rows, columns) {
+  return `<table><thead><tr>${columns.map(column => `<th>${esc(column)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${columns.map(column => `<td>${esc(row[column] ?? '')}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+}
+
+function changeContactsPage(delta) { state.contactsPage = Math.max(1, state.contactsPage + delta); renderContacts(); }
+async function copyToken(token) { await navigator.clipboard.writeText(token); toast('Merge tag copied', token); }
+function toLocalInput(value) { if (!value) return ''; const date = new Date(value); const local = new Date(date.getTime() - date.getTimezoneOffset()*60000); return local.toISOString().slice(0,16); }
+function fmtDate(value) { if (!value) return '—'; const date = new Date(value); return Number.isNaN(date) ? esc(value) : new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(date); }
+function fmt(value) { return new Intl.NumberFormat().format(Number(value || 0)); }
+function esc(value) { return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char])); }
+function toast(heading, message = '', type = '') { const node = document.createElement('div'); node.className = `toast ${type}`; node.innerHTML = `<strong>${esc(heading)}</strong>${message ? `<p>${esc(message)}</p>` : ''}`; toasts.append(node); setTimeout(() => node.remove(), 4500); }
