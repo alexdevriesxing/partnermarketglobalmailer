@@ -1,0 +1,180 @@
+          <div class="notice info" style="margin-top:16px">Cloudflare Email Service sends only from domains onboarded in your account. A sender marked “ready” should already have SPF, DKIM and DMARC configured.</div>
+        </div>
+      </div>
+    </section>`;
+}
+
+async function renderAudiences() {
+  await loadReferenceData();
+  const cards = state.audiences.length ? state.audiences.map(audienceCard).join('') : emptyState('◫', 'No databases yet', 'Create separate audiences for investors, distributors, partners, media contacts or any other segment.', 'new-audience', 'Create database');
+  const tags = state.tags.length ? state.tags.map(tagCard).join('') : '<p class="cell-secondary">No tags created yet.</p>';
+  content.innerHTML = `
+    <div class="section-heading"><div><h2>Audience databases</h2><p>Keep contact collections isolated, sortable and campaign-ready.</p></div><div class="section-actions"><button class="button ghost" data-action="new-tag">＋ New tag</button><button class="button primary" data-action="new-audience">＋ New database</button></div></div>
+    <div class="card-grid">${cards}</div>
+    <section class="panel" style="margin-top:20px">
+      <div class="panel-header"><div><h2>Global tags</h2><p>Tags can span every database and power campaign filters.</p></div></div>
+      <div class="panel-body"><div class="checkbox-row">${tags}</div></div>
+    </section>`;
+}
+
+async function renderContacts() {
+  const query = new URLSearchParams({ page: state.contactsPage, page_size: 50 });
+  if (state.contactsSearch) query.set('search', state.contactsSearch);
+  if (state.contactsAudience) query.set('audience_id', state.contactsAudience);
+  if (state.contactsTag) query.set('tag_id', state.contactsTag);
+  const data = await api(`/api/contacts?${query}`);
+  const rows = data.rows.length ? data.rows.map(contactRow).join('') : emptyTableRow(7, 'No contacts match this view.');
+  content.innerHTML = `
+    <div class="section-heading"><div><h2>Contact intelligence</h2><p>Search, filter, classify and maintain every recipient.</p></div><div class="section-actions"><button class="button ghost" data-action="export-contacts" ${state.contactsAudience ? '' : 'disabled'}>↓ Export CSV</button><button class="button ghost" data-action="import">⇧ Import</button><button class="button primary" data-action="new-contact">＋ New contact</button></div></div>
+    <div class="panel">
+      <div class="panel-body">
+        <div class="toolbar">
+          <div class="toolbar-group">
+            <div class="search"><input id="contactSearch" value="${esc(state.contactsSearch)}" placeholder="Search email, name, company or country"></div>
+            <select id="contactAudience"><option value="">All databases</option>${options(state.audiences, state.contactsAudience)}</select>
+            <select id="contactTag"><option value="">All tags</option>${options(state.tags, state.contactsTag)}</select>
+          </div>
+          <span class="badge"><span class="dot"></span>${fmt(data.total)} contacts</span>
+        </div>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th>Contact</th><th>Company</th><th>Database</th><th>Country</th><th>Tags</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
+    </div>
+    <div class="pagination"><span>Page ${data.page} · ${fmt(data.total)} total</span><div class="section-actions"><button class="button small ghost" data-action="previous-page" ${data.page <= 1 ? 'disabled' : ''}>← Previous</button><button class="button small ghost" data-action="next-page" ${data.page * data.pageSize >= data.total ? 'disabled' : ''}>Next →</button></div></div>`;
+
+  let searchTimer;
+  document.querySelector('#contactSearch').addEventListener('input', (event) => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { state.contactsSearch = event.target.value; state.contactsPage = 1; renderContacts(); }, 320);
+  });
+  document.querySelector('#contactAudience').addEventListener('change', (event) => { state.contactsAudience = event.target.value; state.contactsPage = 1; renderContacts(); });
+  document.querySelector('#contactTag').addEventListener('change', (event) => { state.contactsTag = event.target.value; state.contactsPage = 1; renderContacts(); });
+}
+
+async function renderCampaigns() {
+  const campaigns = await api('/api/campaigns');
+  const cards = campaigns.length ? campaigns.map(campaignCard).join('') : emptyState('✦', 'No campaigns yet', 'Compose a polished email, choose an audience and dispatch it through Cloudflare Queues.', 'new-campaign', 'Compose campaign');
+  content.innerHTML = `
+    <div class="section-heading"><div><h2>Campaign operations</h2><p>Draft, schedule, dispatch and monitor every mass email.</p></div><button class="button primary" data-action="new-campaign">＋ New campaign</button></div>
+    <div class="notice info" style="margin-bottom:16px">Campaigns create an immutable recipient snapshot at launch. Contacts already unsubscribed or suppressed are excluded automatically.</div>
+    <div class="card-grid">${cards}</div>`;
+}
+
+async function renderSenders() {
+  await loadReferenceData();
+  const rows = state.senders.length ? state.senders.map(senderRow).join('') : emptyTableRow(5, 'No sender identities configured.');
+  content.innerHTML = `
+    <div class="section-heading"><div><h2>Sender identities</h2><p>Control display names, From addresses and Reply-To routing.</p></div><button class="button primary" data-action="new-sender">＋ Add sender</button></div>
+    <div class="notice" style="margin-bottom:16px"><strong>Important:</strong> the address can be customized, but its domain must first be onboarded in Cloudflare Email Service. Do not mark a sender ready until SPF, DKIM and DMARC pass.</div>
+    <div class="panel"><div class="table-wrap"><table><thead><tr><th>Identity</th><th>From address</th><th>Reply-To</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
+
+async function renderSuppressions() {
+  const rows = await api('/api/suppressions');
+  content.innerHTML = `
+    <div class="section-heading"><div><h2>Suppression list</h2><p>Permanent protection against sending to opted-out recipients.</p></div><button class="button primary" data-action="new-suppression">＋ Suppress email</button></div>
+    <div class="notice success" style="margin-bottom:16px">One-click unsubscribe links add addresses here automatically and change matching contacts to unsubscribed.</div>
+    <div class="panel"><div class="table-wrap"><table><thead><tr><th>Email</th><th>Reason</th><th>Source</th><th>Date</th><th></th></tr></thead><tbody>${rows.length ? rows.map(suppressionRow).join('') : emptyTableRow(5, 'Your suppression list is empty.')}</tbody></table></div></div>`;
+}
+
+async function renderSettings() {
+  const settings = await api('/api/settings');
+  content.innerHTML = `
+    <div class="section-heading"><div><h2>Workspace settings</h2><p>Default company and compliance details used in email content.</p></div></div>
+    <form class="panel" id="settingsForm">
+      <div class="panel-body form-grid">
+        <label class="field"><span>Company name</span><input name="company_name" value="${esc(settings.company_name || '')}" required></label>
+        <label class="field"><span>Physical mailing address <small>recommended for commercial email compliance</small></span><input name="company_address" value="${esc(settings.company_address || '')}"></label>
+        <label class="field wide"><span>Default footer</span><textarea name="default_footer">${esc(settings.default_footer || '')}</textarea></label>
+        <div class="wide notice info">Authentication and deployment secrets are intentionally not editable in the browser. Configure <span class="code-token">UNSUBSCRIBE_SECRET</span>, Cloudflare Access and GitHub Actions secrets outside the app.</div>
+      </div>
+      <div class="modal-footer"><button class="button primary" type="submit">Save settings</button></div>
+    </form>`;
+  document.querySelector('#settingsForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const body = Object.fromEntries(new FormData(event.currentTarget));
+    await api('/api/settings', { method: 'PATCH', body });
+    toast('Settings saved', 'Workspace defaults were updated.');
+  });
+}
+
+function openAudience(item = null) {
+  openModal({
+    title: item ? 'Edit database' : 'Create database',
+    subtitle: 'Use separate databases for distinct contact collections.',
+    body: `<form id="audienceForm" class="form-grid">
+      <label class="field wide"><span>Name</span><input name="name" value="${esc(item?.name || '')}" placeholder="European investors" required></label>
+      <label class="field wide"><span>Description</span><textarea name="description" placeholder="What belongs in this database?">${esc(item?.description || '')}</textarea></label>
+      <label class="field"><span>Accent color</span><input name="color" type="color" value="${esc(item?.color || '#16b8a6')}"></label>
+    </form>`,
+    footer: `<button class="button ghost" data-action="close-modal">Cancel</button><button class="button primary" type="submit" form="audienceForm">${item ? 'Save changes' : 'Create database'}</button>`
+  });
+  document.querySelector('#audienceForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const body = Object.fromEntries(new FormData(event.currentTarget));
+    await api(item ? `/api/audiences/${item.id}` : '/api/audiences', { method: item ? 'PATCH' : 'POST', body });
+    closeModal(); await loadReferenceData(); await renderCurrent();
+    toast(item ? 'Database updated' : 'Database created', `${body.name} is ready.`);
+  });
+}
+
+async function deleteAudience(id) {
+  const item = state.audiences.find(a => a.id === id);
+  if (!confirm(`Delete “${item?.name || 'this database'}” and all of its contacts?`)) return;
+  await api(`/api/audiences/${id}`, { method: 'DELETE' });
+  await loadReferenceData(); await renderCurrent();
+  toast('Database deleted', 'The database and its contacts were removed.');
+}
+
+function openTag() {
+  openModal({
+    title: 'Create tag', subtitle: 'Build reusable categories across databases.',
+    body: `<form id="tagForm" class="form-grid"><label class="field"><span>Tag name</span><input name="name" placeholder="Series A" required></label><label class="field"><span>Color</span><input type="color" name="color" value="#64748b"></label></form>`,
+    footer: `<button class="button ghost" data-action="close-modal">Cancel</button><button class="button primary" type="submit" form="tagForm">Create tag</button>`
+  });
+  document.querySelector('#tagForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    await api('/api/tags', { method: 'POST', body: Object.fromEntries(new FormData(event.currentTarget)) });
+    closeModal(); await loadReferenceData(); await renderCurrent(); toast('Tag created', 'The tag is now available for contacts and imports.');
+  });
+}
+
+async function deleteTag(id) {
+  if (!confirm('Delete this tag? Contacts will remain in their databases.')) return;
+  await api(`/api/tags/${id}`, { method: 'DELETE' });
+  await loadReferenceData(); await renderCurrent();
+}
+
+function openContact(item = null) {
+  const contact = item || {};
+  const selectedTags = new Set(contact.tag_ids ? contact.tag_ids.split(',') : []);
+  openModal({
+    title: item ? 'Edit contact' : 'Add contact', subtitle: 'Maintain clean, structured recipient data.',
+    body: `<form id="contactForm" class="form-grid">
+      <label class="field"><span>Email address</span><input type="email" name="email" value="${esc(contact.email || '')}" required></label>
+      <label class="field"><span>Database</span><select name="audienceId" required><option value="">Choose database</option>${options(state.audiences, contact.audience_id || state.contactsAudience)}</select></label>
+      <label class="field"><span>First name</span><input name="firstName" value="${esc(contact.first_name || '')}"></label>
+      <label class="field"><span>Last name</span><input name="lastName" value="${esc(contact.last_name || '')}"></label>
+      <label class="field"><span>Company</span><input name="company" value="${esc(contact.company || '')}"></label>
+      <label class="field"><span>Job title</span><input name="jobTitle" value="${esc(contact.job_title || '')}"></label>
+      <label class="field"><span>Country</span><input name="country" value="${esc(contact.country || '')}"></label>
+      <label class="field"><span>Phone</span><input name="phone" value="${esc(contact.phone || '')}"></label>
+      <label class="field"><span>Status</span><select name="status">${statusOptions(contact.status || 'active', ['active','unsubscribed','bounced','invalid'])}</select></label>
+      <div class="field wide"><span>Tags</span><div class="checkbox-row">${tagCheckboxes(selectedTags)}</div></div>
+    </form>`,
+    footer: `<button class="button ghost" data-action="close-modal">Cancel</button><button class="button primary" type="submit" form="contactForm">${item ? 'Save contact' : 'Add contact'}</button>`
+  });
+  document.querySelector('#contactForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const body = Object.fromEntries(form);
+    body.tagIds = [...event.currentTarget.querySelectorAll('input[name="tagIds"]:checked')].map(input => input.value);
+    await api(item ? `/api/contacts/${item.id}` : '/api/contacts', { method: item ? 'PATCH' : 'POST', body });
+    closeModal(); await renderCurrent(); toast(item ? 'Contact updated' : 'Contact added', body.email);
+  });
+}
+
+function openContactFromRow(element) {
+  const encoded = element.closest('tr')?.dataset.row;
+  if (!encoded) return;
+  openContact(JSON.parse(decodeURIComponent(encoded)));
+}
