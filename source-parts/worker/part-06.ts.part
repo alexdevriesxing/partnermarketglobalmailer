@@ -1,0 +1,123 @@
+  try {
+    const value = await request.json();
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Object required");
+    return value as Row;
+  } catch {
+    if (allowEmpty) return {};
+    throw new HttpError(400, "Request body must be valid JSON.");
+  }
+}
+
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
+}
+
+function errorResponse(error: unknown): Response {
+  if (error instanceof HttpError) return json({ error: error.message }, error.status);
+  const message = error instanceof Error ? error.message : "Unexpected server error.";
+  const status = /UNIQUE constraint failed/i.test(message) ? 409 : 500;
+  return json({ error: status === 409 ? "That value already exists." : message }, status);
+}
+
+function withSecurityHeaders(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  headers.set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-src 'self'; base-uri 'self'; form-action 'self'");
+  if (!headers.has("cache-control")) headers.set("cache-control", "no-store");
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function htmlPage(title: string, message: string, status = 200): Response {
+  return new Response(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#071521;color:#e6fffb;font-family:Inter,system-ui,sans-serif}.card{max-width:540px;margin:24px;padding:42px;border:1px solid #1f3948;border-radius:24px;background:#0d2230;box-shadow:0 24px 80px #0008}h1{margin:0 0 12px;font-size:32px}p{color:#9cc7c3;line-height:1.7}</style></head><body><main class="card"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></main></body></html>`, {
+    status,
+    headers: { "content-type": "text/html; charset=utf-8" }
+  });
+}
+
+function requiredString(value: unknown, label: string, max: number): string {
+  const result = String(value ?? "").trim();
+  if (!result) throw new HttpError(400, `${label} is required.`);
+  return result.slice(0, max);
+}
+
+function optionalString(value: unknown, max: number): string {
+  return String(value ?? "").trim().slice(0, max);
+}
+
+function requiredEmail(value: unknown, label: string): string {
+  const email = normalizeEmail(value);
+  if (!email) throw new HttpError(400, `${label} is invalid.`);
+  return email;
+}
+
+function normalizeEmail(value: unknown): string {
+  const email = String(value ?? "").trim().toLowerCase();
+  return EMAIL_RE.test(email) && email.length <= 254 ? email : "";
+}
+
+function safeColor(value: unknown, fallback: string): string {
+  const color = String(value ?? "");
+  return /^#[0-9a-f]{6}$/i.test(color) ? color : fallback;
+}
+
+function enumValue(value: unknown, allowed: string[], fallback: string): string {
+  const candidate = String(value ?? fallback);
+  if (!allowed.includes(candidate)) throw new HttpError(400, "Invalid status value.");
+  return candidate;
+}
+
+function arrayOfStrings(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String).map((item) => item.trim()).filter(Boolean);
+  if (typeof value === "string" && value.trim().startsWith("[")) return parseJsonArray(value).map(String);
+  return [];
+}
+
+function parseJsonObject(value: string): Row {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Row : {};
+  } catch { return {}; }
+}
+
+function parseJsonArray(value: string): unknown[] {
+  try { const parsed = JSON.parse(value); return Array.isArray(parsed) ? parsed : []; }
+  catch { return []; }
+}
+
+function valueAt(row: Row, key: unknown): unknown {
+  return key ? row[String(key)] : "";
+}
+
+function cleanCell(value: unknown, max: number): string {
+  return String(value ?? "").trim().slice(0, max);
+}
+
+function normalizeHeader(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9-]/g, "");
+}
+
+function maxImportRows(env: Env): number {
+  return Math.min(20_000, Math.max(100, Number(env.MAX_IMPORT_ROWS ?? 5000)));
+}
+
+function csvCell(value: unknown): string {
+  const stringValue = String(value ?? "");
+  return /[",\n\r]/.test(stringValue) ? `"${stringValue.replace(/"/g, '""')}"` : stringValue;
+}
+
+function slugify(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "audience";
+}
+
+function escapeHtml(value: unknown): string {
+  return String(value ?? "").replace(/[&<>"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character] ?? character);
+}
+
+class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
