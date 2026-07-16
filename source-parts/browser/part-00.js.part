@@ -1,0 +1,180 @@
+const content = document.querySelector('#content');
+const title = document.querySelector('#viewTitle');
+const eyebrow = document.querySelector('#viewEyebrow');
+const modalBackdrop = document.querySelector('#modalBackdrop');
+const modal = document.querySelector('#modal');
+const toasts = document.querySelector('#toasts');
+
+const state = {
+  view: 'dashboard',
+  session: null,
+  audiences: [],
+  tags: [],
+  senders: [],
+  contactsPage: 1,
+  contactsSearch: '',
+  contactsAudience: '',
+  contactsTag: '',
+  importFile: null,
+  importPreview: null
+};
+
+const viewMeta = {
+  dashboard: ['COMMAND CENTER', 'Overview'],
+  audiences: ['AUDIENCE ARCHITECTURE', 'Databases'],
+  contacts: ['CONTACT INTELLIGENCE', 'Contacts'],
+  campaigns: ['OUTREACH OPERATIONS', 'Campaigns'],
+  senders: ['DELIVERY IDENTITY', 'Senders'],
+  suppressions: ['DELIVERABILITY SAFETY', 'Suppressions'],
+  settings: ['WORKSPACE CONTROL', 'Settings']
+};
+
+boot();
+
+async function boot() {
+  bindGlobalEvents();
+  try {
+    state.session = await api('/api/session');
+    const actor = state.session.actor || 'Admin';
+    document.querySelector('#actorName').textContent = actor;
+    document.querySelector('#avatar').textContent = actor.charAt(0).toUpperCase();
+    await loadReferenceData();
+    await navigate('dashboard');
+  } catch (error) {
+    content.innerHTML = errorState(error);
+  }
+}
+
+function bindGlobalEvents() {
+  document.addEventListener('click', async (event) => {
+    const nav = event.target.closest('[data-view]');
+    if (nav) {
+      await navigate(nav.dataset.view);
+      document.querySelector('#sidebar').classList.remove('open');
+      return;
+    }
+    const action = event.target.closest('[data-action]');
+    if (!action) return;
+    const { action: name, id } = action.dataset;
+    try {
+      await handleAction(name, id, action);
+    } catch (error) {
+      toast('Action failed', error.message, 'error');
+    }
+  });
+
+  document.querySelector('#mobileMenu').addEventListener('click', () => {
+    document.querySelector('#sidebar').classList.toggle('open');
+  });
+
+  modalBackdrop.addEventListener('click', (event) => {
+    if (event.target === modalBackdrop) closeModal();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !modalBackdrop.hidden) closeModal();
+  });
+}
+
+async function handleAction(name, id, element) {
+  const actions = {
+    'import': openImport,
+    'new-campaign': () => openCampaign(),
+    'new-audience': () => openAudience(),
+    'edit-audience': () => openAudience(state.audiences.find((item) => item.id === id)),
+    'delete-audience': () => deleteAudience(id),
+    'view-audience': () => { state.contactsAudience = id; navigate('contacts'); },
+    'new-contact': () => openContact(),
+    'edit-contact': () => openContactFromRow(element),
+    'delete-contact': () => deleteContact(id),
+    'new-tag': openTag,
+    'delete-tag': () => deleteTag(id),
+    'new-sender': () => openSender(),
+    'edit-sender': () => openSender(state.senders.find((item) => item.id === id)),
+    'delete-sender': () => deleteSender(id),
+    'edit-campaign': () => openCampaign(id),
+    'launch-campaign': () => launchCampaign(id),
+    'pause-campaign': () => pauseCampaign(id),
+    'delete-campaign': () => deleteCampaign(id),
+    'new-suppression': openSuppression,
+    'delete-suppression': () => deleteSuppression(id),
+    'close-modal': closeModal,
+    'export-contacts': exportContacts,
+    'refresh': () => renderCurrent(),
+    'previous-page': () => changeContactsPage(-1),
+    'next-page': () => changeContactsPage(1),
+    'copy-token': () => copyToken(element.dataset.token)
+  };
+  if (actions[name]) await actions[name]();
+}
+
+async function navigate(view) {
+  if (!viewMeta[view]) return;
+  state.view = view;
+  document.querySelectorAll('.nav-item').forEach((item) => item.classList.toggle('active', item.dataset.view === view));
+  eyebrow.textContent = viewMeta[view][0];
+  title.textContent = viewMeta[view][1];
+  content.innerHTML = loading();
+  await renderCurrent();
+}
+
+async function renderCurrent() {
+  const renderers = {
+    dashboard: renderDashboard,
+    audiences: renderAudiences,
+    contacts: renderContacts,
+    campaigns: renderCampaigns,
+    senders: renderSenders,
+    suppressions: renderSuppressions,
+    settings: renderSettings
+  };
+  try {
+    await renderers[state.view]();
+  } catch (error) {
+    content.innerHTML = errorState(error);
+  }
+}
+
+async function loadReferenceData() {
+  const [audiences, tags, senders] = await Promise.all([
+    api('/api/audiences'), api('/api/tags'), api('/api/senders')
+  ]);
+  state.audiences = audiences;
+  state.tags = tags;
+  state.senders = senders;
+}
+
+async function renderDashboard() {
+  const data = await api('/api/dashboard');
+  const recentRows = data.recentCampaigns?.length ? data.recentCampaigns.map(campaignRow).join('') : emptyTableRow(6, 'No campaigns yet. Create your first campaign to start sending.');
+  content.innerHTML = `
+    <section class="hero-panel">
+      <span class="hero-kicker">Cloudflare email operations</span>
+      <h2>Build relationships at global scale — without losing control.</h2>
+      <p>Organize audience databases, import spreadsheets, create personalized campaigns and dispatch them through Cloudflare Queues and Email Service with suppression safety built in.</p>
+      <div class="hero-actions">
+        <button class="button primary" data-action="new-campaign">＋ Compose campaign</button>
+        <button class="button ghost" data-action="import">⇧ Import contacts</button>
+      </div>
+    </section>
+    <section class="stat-grid">
+      ${statCard('Active contacts', data.counts.contacts, 'Sendable recipients')}
+      ${statCard('Databases', data.counts.audiences, 'Segmented audiences')}
+      ${statCard('Campaigns', data.counts.campaigns, 'Draft and delivered')}
+      ${statCard('Emails sent', data.counts.sent, 'Successful deliveries')}
+      ${statCard('Suppressed', data.counts.suppressed, 'Protected opt-outs')}
+    </section>
+    <section class="grid-2">
+      <div class="panel">
+        <div class="panel-header"><div><h2>Recent campaigns</h2><p>Latest delivery activity across your audiences</p></div><button class="button small ghost" data-view="campaigns">View all</button></div>
+        <div class="table-wrap"><table><thead><tr><th>Campaign</th><th>Status</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Created</th></tr></thead><tbody>${recentRows}</tbody></table></div>
+      </div>
+      <div class="panel">
+        <div class="panel-header"><div><h2>Launch checklist</h2><p>Before your first production send</p></div></div>
+        <div class="panel-body">
+          <div class="checklist">
+            ${checkItem('Protect the app with Cloudflare Access', true)}
+            ${checkItem('Create and migrate the D1 database', true)}
+            ${checkItem('Onboard a sending domain in Email Service', state.senders.some(s => s.status === 'ready'))}
+            ${checkItem('Add an authenticated sender identity', state.senders.length > 0)}
+            ${checkItem('Set the unsubscribe signing secret', true)}
+          </div>
