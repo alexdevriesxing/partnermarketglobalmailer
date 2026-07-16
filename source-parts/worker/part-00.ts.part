@@ -1,0 +1,180 @@
+import * as XLSX from "@e965/xlsx";
+
+interface EmailBinding {
+  send(message: {
+    from: string | { email: string; name?: string };
+    to: string | { email: string; name?: string } | Array<string | { email: string; name?: string }>;
+    subject: string;
+    html?: string;
+    text?: string;
+    replyTo?: string | { email: string; name?: string };
+    headers?: Record<string, string>;
+  }): Promise<{ messageId?: string }>;
+}
+
+interface Env {
+  DB: D1Database;
+  SEND_QUEUE: Queue<SendJob>;
+  EMAIL: EmailBinding;
+  ASSETS: Fetcher;
+  APP_NAME?: string;
+  REQUIRE_ACCESS?: string;
+  ADMIN_EMAILS?: string;
+  PUBLIC_BASE_URL?: string;
+  UNSUBSCRIBE_SECRET?: string;
+  MAX_IMPORT_ROWS?: string;
+  SEND_BATCH_PER_MINUTE?: string;
+}
+
+interface SendJob {
+  recipientId: string;
+}
+
+type Json = Record<string, unknown> | unknown[];
+type RouteContext = { request: Request; env: Env; ctx: ExecutionContext; url: URL; params: Record<string, string> };
+
+type Row = Record<string, unknown>;
+
+const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
+const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/unsubscribe") {
+      return handleUnsubscribe(request, env, url);
+    }
+
+    if (!url.pathname.startsWith("/api/")) {
+      return withSecurityHeaders(await env.ASSETS.fetch(request));
+    }
+
+    try {
+      const actor = authorize(request, env);
+      enforceSameOrigin(request, url);
+      const response = await route({ request, env, ctx, url, params: {} }, actor);
+      return withSecurityHeaders(response);
+    } catch (error) {
+      console.error("API error", error);
+      return withSecurityHeaders(errorResponse(error));
+    }
+  },
+
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(dispatchPendingRecipients(env));
+  },
+
+  async queue(batch: MessageBatch<SendJob>, env: Env): Promise<void> {
+    for (const message of batch.messages) {
+      await deliverRecipient(message, env);
+    }
+  }
+};
+
+function authorize(request: Request, env: Env): string {
+  const accessEmail = request.headers.get("Cf-Access-Authenticated-User-Email")?.trim().toLowerCase();
+  const accessJwt = request.headers.get("Cf-Access-Jwt-Assertion");
+  const requireAccess = (env.REQUIRE_ACCESS ?? "true").toLowerCase() === "true";
+
+  if (!requireAccess) return accessEmail || "local-admin";
+  if (!accessEmail || !accessJwt) throw new HttpError(401, "Cloudflare Access authentication is required.");
+
+  const allowed = (env.ADMIN_EMAILS ?? "")
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean);
+  if (allowed.length && !allowed.includes(accessEmail)) {
+    throw new HttpError(403, "This account is not authorized for the mailer.");
+  }
+  return accessEmail;
+}
+
+function enforceSameOrigin(request: Request, url: URL): void {
+  if (!MUTATING.has(request.method.toUpperCase())) return;
+  const origin = request.headers.get("Origin");
+  if (origin && new URL(origin).host !== url.host) {
+    throw new HttpError(403, "Cross-origin write requests are blocked.");
+  }
+}
+
+async function route(routeContext: RouteContext, actor: string): Promise<Response> {
+  const { request, env, ctx, url } = routeContext;
+  const method = request.method.toUpperCase();
+  const path = url.pathname;
+
+  if (method === "GET" && path === "/api/session") {
+    return json({ actor, appName: env.APP_NAME ?? "PartnerMarket Global Mailer" });
+  }
+  if (method === "GET" && path === "/api/dashboard") return dashboard(env);
+
+  if (path === "/api/audiences" && method === "GET") return listAudiences(env);
+  if (path === "/api/audiences" && method === "POST") return createAudience(request, env);
+  if (matchPath(path, "/api/audiences/:id", routeContext.params)) {
+    if (method === "PATCH") return updateAudience(request, env, routeContext.params.id);
+    if (method === "DELETE") return deleteAudience(env, routeContext.params.id);
+  }
+
+  if (path === "/api/contacts" && method === "GET") return listContacts(env, url);
+  if (path === "/api/contacts" && method === "POST") return createContact(request, env);
+  if (matchPath(path, "/api/contacts/:id", routeContext.params)) {
+    if (method === "PATCH") return updateContact(request, env, routeContext.params.id);
+    if (method === "DELETE") return deleteContact(env, routeContext.params.id);
+  }
+  if (path === "/api/contacts/export" && method === "GET") return exportContacts(env, url);
+
+  if (path === "/api/imports/preview" && method === "POST") return previewImport(request, env);
+  if (path === "/api/imports/commit" && method === "POST") return commitImport(request, env);
+
+  if (path === "/api/tags" && method === "GET") return listTags(env);
+  if (path === "/api/tags" && method === "POST") return createTag(request, env);
+  if (matchPath(path, "/api/tags/:id", routeContext.params) && method === "DELETE") {
+    return deleteTag(env, routeContext.params.id);
+  }
+
+  if (path === "/api/senders" && method === "GET") return listSenders(env);
+  if (path === "/api/senders" && method === "POST") return createSender(request, env);
+  if (matchPath(path, "/api/senders/:id", routeContext.params)) {
+    if (method === "PATCH") return updateSender(request, env, routeContext.params.id);
+    if (method === "DELETE") return deleteSender(env, routeContext.params.id);
+  }
+
+  if (path === "/api/campaigns" && method === "GET") return listCampaigns(env);
+  if (path === "/api/campaigns" && method === "POST") return createCampaign(request, env);
+  if (matchPath(path, "/api/campaigns/:id/launch", routeContext.params) && method === "POST") {
+    const response = await launchCampaign(request, env, routeContext.params.id);
+    ctx.waitUntil(dispatchPendingRecipients(env));
+    return response;
+  }
+  if (matchPath(path, "/api/campaigns/:id/pause", routeContext.params) && method === "POST") {
+    return pauseCampaign(env, routeContext.params.id);
+  }
+  if (matchPath(path, "/api/campaigns/:id/recipients", routeContext.params) && method === "GET") {
+    return listCampaignRecipients(env, routeContext.params.id, url);
+  }
+  if (matchPath(path, "/api/campaigns/:id", routeContext.params)) {
+    if (method === "GET") return getCampaign(env, routeContext.params.id);
+    if (method === "PATCH") return updateCampaign(request, env, routeContext.params.id);
+    if (method === "DELETE") return deleteCampaign(env, routeContext.params.id);
+  }
+
+  if (path === "/api/suppressions" && method === "GET") return listSuppressions(env, url);
+  if (path === "/api/suppressions" && method === "POST") return createSuppression(request, env);
+  if (matchPath(path, "/api/suppressions/:email", routeContext.params) && method === "DELETE") {
+    return deleteSuppression(env, decodeURIComponent(routeContext.params.email));
+  }
+
+  if (path === "/api/settings" && method === "GET") return getSettings(env);
+  if (path === "/api/settings" && method === "PATCH") return updateSettings(request, env);
+
+  throw new HttpError(404, "API route not found.");
+}
+
+async function dashboard(env: Env): Promise<Response> {
+  const [audiences, contacts, campaigns, sent, suppressed, recent] = await Promise.all([
+    env.DB.prepare("SELECT COUNT(*) AS count FROM audiences").first<{ count: number }>(),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM contacts WHERE status = 'active'").first<{ count: number }>(),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM campaigns").first<{ count: number }>(),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM campaign_recipients WHERE status = 'sent'").first<{ count: number }>(),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM suppressions").first<{ count: number }>(),
