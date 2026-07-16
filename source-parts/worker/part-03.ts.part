@@ -1,0 +1,180 @@
+  if (!campaign) throw new HttpError(404, "Campaign not found.");
+  const stats = await campaignStats(env, id);
+  return json({ ...campaign, stats });
+}
+
+async function createCampaign(request: Request, env: Env): Promise<Response> {
+  const body = await readJson(request);
+  const id = crypto.randomUUID();
+  const campaign = normalizeCampaign(body);
+  await validateCampaignReferences(env, campaign.audienceId, campaign.senderId);
+  await env.DB.prepare(`
+    INSERT INTO campaigns (id, name, audience_id, sender_id, subject, preview_text, html_body, text_body, filter_tags_json, status, scheduled_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+  `).bind(id, campaign.name, campaign.audienceId, campaign.senderId, campaign.subject, campaign.previewText,
+    campaign.htmlBody, campaign.textBody, JSON.stringify(campaign.filterTagIds), campaign.scheduledAt).run();
+  return json({ id, ...campaign, status: "draft" }, 201);
+}
+
+async function updateCampaign(request: Request, env: Env, id: string): Promise<Response> {
+  const existing = await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(id).first<Row>();
+  if (!existing) throw new HttpError(404, "Campaign not found.");
+  if (!["draft", "scheduled", "paused"].includes(String(existing.status))) {
+    throw new HttpError(409, "Only draft, scheduled, or paused campaigns can be edited.");
+  }
+  const body = await readJson(request);
+  const merged = {
+    name: body.name ?? existing.name,
+    audienceId: body.audienceId ?? existing.audience_id,
+    senderId: body.senderId ?? existing.sender_id,
+    subject: body.subject ?? existing.subject,
+    previewText: body.previewText ?? existing.preview_text,
+    htmlBody: body.htmlBody ?? existing.html_body,
+    textBody: body.textBody ?? existing.text_body,
+    filterTagIds: body.filterTagIds ?? parseJsonArray(String(existing.filter_tags_json ?? "[]")),
+    scheduledAt: body.scheduledAt ?? existing.scheduled_at
+  };
+  const campaign = normalizeCampaign(merged);
+  await validateCampaignReferences(env, campaign.audienceId, campaign.senderId);
+  await env.DB.prepare(`
+    UPDATE campaigns SET name = ?, audience_id = ?, sender_id = ?, subject = ?, preview_text = ?, html_body = ?,
+      text_body = ?, filter_tags_json = ?, scheduled_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+  `).bind(campaign.name, campaign.audienceId, campaign.senderId, campaign.subject, campaign.previewText,
+    campaign.htmlBody, campaign.textBody, JSON.stringify(campaign.filterTagIds), campaign.scheduledAt, id).run();
+  return json({ id, ...campaign, status: existing.status });
+}
+
+async function deleteCampaign(env: Env, id: string): Promise<Response> {
+  const existing = await env.DB.prepare("SELECT status FROM campaigns WHERE id = ?").bind(id).first<{ status: string }>();
+  if (!existing) throw new HttpError(404, "Campaign not found.");
+  if (!["draft", "cancelled"].includes(existing.status)) throw new HttpError(409, "Only draft or cancelled campaigns can be deleted.");
+  await env.DB.prepare("DELETE FROM campaigns WHERE id = ?").bind(id).run();
+  return json({ ok: true });
+}
+
+async function launchCampaign(request: Request, env: Env, id: string): Promise<Response> {
+  const campaign = await env.DB.prepare(`
+    SELECT c.*, s.status AS sender_status, s.email AS sender_email
+    FROM campaigns c JOIN sender_identities s ON s.id = c.sender_id WHERE c.id = ?
+  `).bind(id).first<Row>();
+  if (!campaign) throw new HttpError(404, "Campaign not found.");
+  if (!["draft", "scheduled", "paused"].includes(String(campaign.status))) throw new HttpError(409, "Campaign is already active or complete.");
+  if (campaign.sender_status !== "ready") {
+    throw new HttpError(409, "Mark the sender identity as ready after its Cloudflare sending domain is onboarded.");
+  }
+  const body = await readJson(request, true);
+  const scheduledAt = body.scheduledAt ? normalizeDateTime(body.scheduledAt) : (campaign.scheduled_at ? String(campaign.scheduled_at) : null);
+  const tagIds = parseJsonArray(String(campaign.filter_tags_json ?? "[]")).map(String).slice(0, 50);
+  let tagClause = "";
+  if (tagIds.length) {
+    tagClause = `AND EXISTS (
+      SELECT 1 FROM contact_tags ct WHERE ct.contact_id = c.id AND ct.tag_id IN (${tagIds.map(() => "?").join(",")})
+    )`;
+  }
+
+  await env.DB.prepare("DELETE FROM campaign_recipients WHERE campaign_id = ? AND status IN ('pending', 'queued', 'failed', 'suppressed')")
+    .bind(id).run();
+  const inserted = await env.DB.prepare(`
+    INSERT OR IGNORE INTO campaign_recipients (id, campaign_id, contact_id, email, status)
+    SELECT lower(hex(randomblob(16))), ?, c.id, c.email,
+      CASE WHEN s.email IS NOT NULL OR c.status <> 'active' THEN 'suppressed' ELSE 'pending' END
+    FROM contacts c
+    LEFT JOIN suppressions s ON s.email = c.email
+    WHERE c.audience_id = ? ${tagClause}
+  `).bind(id, campaign.audience_id, ...tagIds).run();
+
+  const nextStatus = scheduledAt && new Date(scheduledAt).getTime() > Date.now() ? "scheduled" : "queued";
+  await env.DB.prepare(`
+    UPDATE campaigns SET status = ?, scheduled_at = ?, launched_at = COALESCE(launched_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = ?
+  `).bind(nextStatus, scheduledAt, id).run();
+  await addEvent(env, id, null, "campaign_launched", { actor: "admin", recipients: inserted.meta.changes, scheduledAt });
+  return json({ ok: true, status: nextStatus, recipients: inserted.meta.changes });
+}
+
+async function pauseCampaign(env: Env, id: string): Promise<Response> {
+  const result = await env.DB.prepare(`
+    UPDATE campaigns SET status = 'paused', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('queued', 'sending', 'scheduled')
+  `).bind(id).run();
+  if (!result.meta.changes) throw new HttpError(409, "Campaign cannot be paused from its current status.");
+  return json({ ok: true, status: "paused" });
+}
+
+async function listCampaignRecipients(env: Env, id: string, url: URL): Promise<Response> {
+  const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));
+  const pageSize = Math.min(100, Math.max(10, Number(url.searchParams.get("page_size") ?? 50)));
+  const status = url.searchParams.get("status") ?? "";
+  const where = status ? "campaign_id = ? AND status = ?" : "campaign_id = ?";
+  const bindings = status ? [id, status] : [id];
+  const [rows, count] = await Promise.all([
+    env.DB.prepare(`SELECT * FROM campaign_recipients WHERE ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
+      .bind(...bindings, pageSize, (page - 1) * pageSize).all(),
+    env.DB.prepare(`SELECT COUNT(*) AS count FROM campaign_recipients WHERE ${where}`).bind(...bindings).first<{ count: number }>()
+  ]);
+  return json({ rows: rows.results, total: Number(count?.count ?? 0), page, pageSize });
+}
+
+async function listSuppressions(env: Env, url: URL): Promise<Response> {
+  const search = (url.searchParams.get("search") ?? "").slice(0, 80);
+  const result = search
+    ? await env.DB.prepare("SELECT * FROM suppressions WHERE email LIKE ? ORDER BY created_at DESC LIMIT 500").bind(`%${search}%`).all()
+    : await env.DB.prepare("SELECT * FROM suppressions ORDER BY created_at DESC LIMIT 500").all();
+  return json(result.results);
+}
+
+async function createSuppression(request: Request, env: Env): Promise<Response> {
+  const body = await readJson(request);
+  const email = requiredEmail(body.email, "Email");
+  const reason = optionalString(body.reason, 250) || "manual suppression";
+  await env.DB.prepare("INSERT INTO suppressions (email, reason, source) VALUES (?, ?, 'manual') ON CONFLICT(email) DO UPDATE SET reason = excluded.reason")
+    .bind(email, reason).run();
+  await env.DB.prepare("UPDATE contacts SET status = 'unsubscribed', updated_at = CURRENT_TIMESTAMP WHERE email = ?").bind(email).run();
+  return json({ email, reason }, 201);
+}
+
+async function deleteSuppression(env: Env, emailValue: string): Promise<Response> {
+  const email = requiredEmail(emailValue, "Email");
+  const result = await env.DB.prepare("DELETE FROM suppressions WHERE email = ?").bind(email).run();
+  if (!result.meta.changes) throw new HttpError(404, "Suppression not found.");
+  return json({ ok: true });
+}
+
+async function getSettings(env: Env): Promise<Response> {
+  const result = await env.DB.prepare("SELECT key, value FROM settings").all<{ key: string; value: string }>();
+  return json(Object.fromEntries(result.results.map((row) => [row.key, row.value])));
+}
+
+async function updateSettings(request: Request, env: Env): Promise<Response> {
+  const body = await readJson(request);
+  const allowed = new Set(["company_name", "company_address", "default_footer"]);
+  const statements: D1PreparedStatement[] = [];
+  const statement = env.DB.prepare(`
+    INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+  `);
+  for (const [key, value] of Object.entries(body)) {
+    if (allowed.has(key)) statements.push(statement.bind(key, optionalString(value, 2000)));
+  }
+  if (statements.length) await env.DB.batch(statements);
+  return getSettings(env);
+}
+
+async function dispatchPendingRecipients(env: Env): Promise<void> {
+  const limit = Math.min(2000, Math.max(10, Number(env.SEND_BATCH_PER_MINUTE ?? 500)));
+  await env.DB.prepare(`
+    UPDATE campaigns SET status = 'queued', updated_at = CURRENT_TIMESTAMP
+    WHERE status = 'scheduled' AND scheduled_at IS NOT NULL AND datetime(scheduled_at) <= datetime('now')
+  `).run();
+
+  const result = await env.DB.prepare(`
+    SELECT cr.id, cr.campaign_id
+    FROM campaign_recipients cr
+    JOIN campaigns c ON c.id = cr.campaign_id
+    WHERE cr.status = 'pending' AND c.status IN ('queued', 'sending')
+    ORDER BY cr.created_at
+    LIMIT ?
+  `).bind(limit).all<{ id: string; campaign_id: string }>();
+  if (!result.results.length) return;
+
+  const updateQueued = env.DB.prepare("UPDATE campaign_recipients SET status = 'queued', queued_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'");
+  const resetPending = env.DB.prepare("UPDATE campaign_recipients SET status = 'pending', queued_at = NULL WHERE id = ? AND status = 'queued'");
+
