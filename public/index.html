@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#071720">
+  <meta name="description" content="PartnerMarket Global Mailer — Cloudflare-native audience management and email campaigns.">
+  <title>PartnerMarket Global Mailer</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span>PM</span></div>
+        <div>
+          <strong>PartnerMarket</strong>
+          <small>Global Mailer</small>
+        </div>
+      </div>
+      <nav class="nav" aria-label="Main navigation">
+        <button class="nav-item active" data-view="dashboard"><span class="nav-icon">⌂</span><span>Overview</span></button>
+        <button class="nav-item" data-view="audiences"><span class="nav-icon">◫</span><span>Databases</span></button>
+        <button class="nav-item" data-view="contacts"><span class="nav-icon">◎</span><span>Contacts</span></button>
+        <button class="nav-item" data-view="campaigns"><span class="nav-icon">✦</span><span>Campaigns</span></button>
+        <button class="nav-item" data-view="senders"><span class="nav-icon">↗</span><span>Senders</span></button>
+        <button class="nav-item" data-view="suppressions"><span class="nav-icon">⊘</span><span>Suppressions</span></button>
+        <button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span><span>Settings</span></button>
+      </nav>
+      <div class="sidebar-card">
+        <div class="live-dot"><span></span> Cloudflare native</div>
+        <p>D1, Queues, Workers, Access and Email Service.</p>
+      </div>
+      <div class="sidebar-footer">
+        <span class="avatar" id="avatar">A</span>
+        <div><strong id="actorName">Admin</strong><small>Protected by Access</small></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="mobile-menu" id="mobileMenu" aria-label="Open menu">☰</button>
+        <div>
+          <p class="eyebrow" id="viewEyebrow">COMMAND CENTER</p>
+          <h1 id="viewTitle">Overview</h1>
+        </div>
+        <div class="topbar-actions">
+          <button class="button ghost" data-action="import"><span>⇧</span> Import list</button>
+          <button class="button primary" data-action="new-campaign"><span>＋</span> New campaign</button>
+        </div>
+      </header>
+      <section class="content" id="content" aria-live="polite">
+        <div class="loading-state"><span class="spinner"></span><p>Loading your mailer…</p></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="modalBackdrop" hidden>
+    <section class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle"></section>
+  </div>
+  <div class="toast-stack" id="toasts" aria-live="assertive"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
