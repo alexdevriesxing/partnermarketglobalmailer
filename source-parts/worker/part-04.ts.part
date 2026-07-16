@@ -1,0 +1,180 @@
+  for (let index = 0; index < result.results.length; index += 100) {
+    const chunk = result.results.slice(index, index + 100);
+    await env.DB.batch(chunk.map((row) => updateQueued.bind(row.id)));
+    try {
+      await env.SEND_QUEUE.sendBatch(chunk.map((row) => ({ body: { recipientId: row.id } })));
+    } catch (error) {
+      await env.DB.batch(chunk.map((row) => resetPending.bind(row.id)));
+      throw error;
+    }
+  }
+
+  const campaignIds = [...new Set(result.results.map((row) => row.campaign_id))];
+  const markSending = env.DB.prepare("UPDATE campaigns SET status = 'sending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'queued'");
+  await env.DB.batch(campaignIds.map((campaignId) => markSending.bind(campaignId)));
+}
+
+async function deliverRecipient(message: Message<SendJob>, env: Env): Promise<void> {
+  const recipientId = message.body?.recipientId;
+  if (!recipientId) { message.ack(); return; }
+
+  const row = await env.DB.prepare(`
+    SELECT cr.*, c.name AS campaign_name, c.subject, c.preview_text, c.html_body, c.text_body, c.status AS campaign_status,
+      ct.first_name, ct.last_name, ct.company, ct.job_title, ct.country, ct.phone, ct.custom_json,
+      s.name AS sender_name, s.email AS sender_email, s.reply_to, s.status AS sender_status
+    FROM campaign_recipients cr
+    JOIN campaigns c ON c.id = cr.campaign_id
+    JOIN contacts ct ON ct.id = cr.contact_id
+    JOIN sender_identities s ON s.id = c.sender_id
+    WHERE cr.id = ?
+  `).bind(recipientId).first<Row>();
+
+  if (!row || ["sent", "suppressed"].includes(String(row.status))) { message.ack(); return; }
+  if (["paused", "scheduled"].includes(String(row.campaign_status))) {
+    await env.DB.prepare("UPDATE campaign_recipients SET status = 'pending', queued_at = NULL WHERE id = ? AND status IN ('queued', 'sending')")
+      .bind(recipientId).run();
+    message.ack();
+    return;
+  }
+  if (!["queued", "sending"].includes(String(row.campaign_status))) { message.ack(); return; }
+
+  const suppressed = await env.DB.prepare("SELECT 1 AS yes FROM suppressions WHERE email = ?").bind(row.email).first();
+  if (suppressed) {
+    await env.DB.prepare("UPDATE campaign_recipients SET status = 'suppressed', last_error = 'Suppression list' WHERE id = ?").bind(recipientId).run();
+    message.ack();
+    await finalizeCampaignIfDone(env, String(row.campaign_id));
+    return;
+  }
+  if (row.sender_status !== "ready") {
+    await markFailedAttempt(env, recipientId, "Sender identity is not ready", Number(row.attempts));
+    message.ack();
+    return;
+  }
+
+  await env.DB.prepare("UPDATE campaign_recipients SET status = 'sending' WHERE id = ?").bind(recipientId).run();
+  try {
+    const baseUrl = (env.PUBLIC_BASE_URL ?? "").replace(/\/$/, "");
+    const token = await makeUnsubscribeToken(env, String(row.contact_id), String(row.campaign_id), String(row.email));
+    const unsubscribeUrl = `${baseUrl}/unsubscribe?token=${encodeURIComponent(token)}`;
+    const mergeData = {
+      email: String(row.email),
+      first_name: String(row.first_name ?? ""),
+      last_name: String(row.last_name ?? ""),
+      full_name: `${row.first_name ?? ""} ${row.last_name ?? ""}`.trim(),
+      company: String(row.company ?? ""),
+      job_title: String(row.job_title ?? ""),
+      country: String(row.country ?? ""),
+      phone: String(row.phone ?? ""),
+      unsubscribe_url: unsubscribeUrl,
+      ...parseJsonObject(String(row.custom_json ?? "{}"))
+    };
+    const html = ensureUnsubscribeFooter(sanitizeEmailHtml(mergeHtml(String(row.html_body), mergeData)), unsubscribeUrl);
+    const text = ensureTextUnsubscribe(mergeText(String(row.text_body || stripHtml(String(row.html_body))), mergeData), unsubscribeUrl);
+    const subject = mergeText(String(row.subject), mergeData).slice(0, 998);
+
+    const result = await env.EMAIL.send({
+      from: { email: String(row.sender_email), name: String(row.sender_name) },
+      to: { email: String(row.email), name: String(mergeData.full_name) || undefined },
+      subject,
+      html,
+      text,
+      replyTo: row.reply_to ? String(row.reply_to) : undefined,
+      headers: {
+        "List-Unsubscribe": `<${unsubscribeUrl}>`,
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+        "X-Campaign-ID": String(row.campaign_id),
+        "X-Recipient-ID": recipientId
+      }
+    });
+
+    await env.DB.batch([
+      env.DB.prepare("UPDATE campaign_recipients SET status = 'sent', attempts = attempts + 1, sent_at = CURRENT_TIMESTAMP, last_error = '' WHERE id = ?").bind(recipientId),
+      env.DB.prepare("INSERT INTO events (id, campaign_id, contact_id, type, metadata_json) VALUES (?, ?, ?, 'sent', ?)")
+        .bind(crypto.randomUUID(), row.campaign_id, row.contact_id, JSON.stringify({ messageId: result.messageId ?? null }))
+    ]);
+    message.ack();
+    await finalizeCampaignIfDone(env, String(row.campaign_id));
+  } catch (error) {
+    const attempts = Number(row.attempts ?? 0) + 1;
+    const reason = error instanceof Error ? error.message.slice(0, 900) : "Unknown delivery error";
+    await env.DB.prepare("UPDATE campaign_recipients SET status = ?, attempts = ?, last_error = ? WHERE id = ?")
+      .bind(attempts >= 3 ? "failed" : "queued", attempts, reason, recipientId).run();
+    await addEvent(env, String(row.campaign_id), String(row.contact_id), "send_failed", { reason, attempts });
+    if (attempts >= 3) {
+      message.ack();
+      await finalizeCampaignIfDone(env, String(row.campaign_id));
+    } else {
+      message.retry();
+    }
+  }
+}
+
+async function handleUnsubscribe(request: Request, env: Env, url: URL): Promise<Response> {
+  let token = url.searchParams.get("token") ?? "";
+  if (request.method === "POST") {
+    const contentType = request.headers.get("content-type") ?? "";
+    if (contentType.includes("application/x-www-form-urlencoded")) {
+      const form = await request.formData();
+      token = String(form.get("token") ?? token);
+    }
+  }
+  try {
+    const payload = await verifyUnsubscribeToken(env, token);
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO suppressions (email, reason, source) VALUES (?, 'Unsubscribed by recipient', 'one-click') ON CONFLICT(email) DO NOTHING").bind(payload.email),
+      env.DB.prepare("UPDATE contacts SET status = 'unsubscribed', updated_at = CURRENT_TIMESTAMP WHERE email = ?").bind(payload.email),
+      env.DB.prepare("INSERT INTO events (id, campaign_id, contact_id, type, metadata_json) VALUES (?, ?, ?, 'unsubscribed', '{}')")
+        .bind(crypto.randomUUID(), payload.campaignId, payload.contactId)
+    ]);
+    if (request.method === "POST") return new Response(null, { status: 204 });
+    return htmlPage("You are unsubscribed", "This email address has been removed from future PartnerMarket Global campaigns.");
+  } catch {
+    return htmlPage("Invalid unsubscribe link", "This link is invalid or expired. Contact the sender to be removed manually.", 400);
+  }
+}
+
+async function campaignStats(env: Env, id: string): Promise<Record<string, number>> {
+  const result = await env.DB.prepare(`
+    SELECT COUNT(*) AS recipients,
+      SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN status IN ('queued', 'sending') THEN 1 ELSE 0 END) AS processing,
+      SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent,
+      SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+      SUM(CASE WHEN status = 'suppressed' THEN 1 ELSE 0 END) AS suppressed
+    FROM campaign_recipients WHERE campaign_id = ?
+  `).bind(id).first<Row>();
+  return Object.fromEntries(Object.entries(result ?? {}).map(([key, value]) => [key, Number(value ?? 0)]));
+}
+
+async function finalizeCampaignIfDone(env: Env, campaignId: string): Promise<void> {
+  const remaining = await env.DB.prepare(`
+    SELECT COUNT(*) AS count FROM campaign_recipients WHERE campaign_id = ? AND status IN ('pending', 'queued', 'sending')
+  `).bind(campaignId).first<{ count: number }>();
+  if (Number(remaining?.count ?? 0) === 0) {
+    await env.DB.prepare("UPDATE campaigns SET status = 'completed', completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'sending'")
+      .bind(campaignId).run();
+  }
+}
+
+async function markFailedAttempt(env: Env, recipientId: string, error: string, attempts: number): Promise<void> {
+  await env.DB.prepare("UPDATE campaign_recipients SET status = 'failed', attempts = ?, last_error = ? WHERE id = ?")
+    .bind(attempts + 1, error, recipientId).run();
+}
+
+async function addEvent(env: Env, campaignId: string | null, contactId: string | null, type: string, metadata: Json): Promise<void> {
+  await env.DB.prepare("INSERT INTO events (id, campaign_id, contact_id, type, metadata_json) VALUES (?, ?, ?, ?, ?)")
+    .bind(crypto.randomUUID(), campaignId, contactId, type, JSON.stringify(metadata)).run();
+}
+
+async function validateCampaignReferences(env: Env, audienceId: string, senderId: string): Promise<void> {
+  const [audience, sender] = await Promise.all([
+    env.DB.prepare("SELECT id FROM audiences WHERE id = ?").bind(audienceId).first(),
+    env.DB.prepare("SELECT id FROM sender_identities WHERE id = ?").bind(senderId).first()
+  ]);
+  if (!audience) throw new HttpError(400, "Choose a valid audience.");
+  if (!sender) throw new HttpError(400, "Choose a valid sender identity.");
+}
+
+async function replaceContactTags(env: Env, contactId: string, tagIds: string[]): Promise<void> {
+  const statements: D1PreparedStatement[] = [env.DB.prepare("DELETE FROM contact_tags WHERE contact_id = ?").bind(contactId)];
+  const insert = env.DB.prepare("INSERT OR IGNORE INTO contact_tags (contact_id, tag_id) VALUES (?, ?)");
