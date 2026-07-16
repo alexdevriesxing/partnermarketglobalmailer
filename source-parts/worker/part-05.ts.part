@@ -1,0 +1,180 @@
+  for (const tagId of tagIds.slice(0, 50)) statements.push(insert.bind(contactId, tagId));
+  await env.DB.batch(statements);
+}
+
+async function parseSpreadsheet(file: File, maxRows: number): Promise<Row[]> {
+  const extension = file.name.toLowerCase().split(".").pop();
+  if (!extension || !["csv", "xlsx", "xls"].includes(extension)) {
+    throw new HttpError(415, "Only CSV, XLS, and XLSX files are supported.");
+  }
+  if (file.size > 15 * 1024 * 1024) throw new HttpError(413, "Import files must be 15 MB or smaller.");
+  const data = new Uint8Array(await file.arrayBuffer());
+  const workbook = XLSX.read(data, { type: "array", cellDates: true });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) return [];
+  const raw = XLSX.utils.sheet_to_json<Row>(workbook.Sheets[sheetName], { defval: "", raw: false });
+  return raw.slice(0, maxRows).map((row) => Object.fromEntries(
+    Object.entries(row).map(([key, value]) => [String(key).trim(), typeof value === "string" ? value.trim() : value])
+  ));
+}
+
+function suggestMapping(columns: string[]): Row {
+  const normalized = columns.map((column) => ({ original: column, key: normalizeHeader(column) }));
+  const aliases: Record<string, string[]> = {
+    email: ["email", "emailaddress", "emailadres", "mail", "e-mail"],
+    firstName: ["firstname", "first", "givenname", "voornaam"],
+    lastName: ["lastname", "last", "surname", "familyname", "achternaam"],
+    company: ["company", "organization", "organisation", "business", "bedrijf"],
+    jobTitle: ["jobtitle", "title", "position", "role", "functie"],
+    country: ["country", "land"],
+    phone: ["phone", "telephone", "mobile", "tel", "telefoon"]
+  };
+  return Object.fromEntries(Object.entries(aliases).map(([field, values]) => {
+    const found = normalized.find((column) => values.includes(column.key));
+    return [field, found?.original ?? ""];
+  }));
+}
+
+function normalizeContact(body: Row): {
+  audienceId: string; email: string; firstName: string; lastName: string; company: string; jobTitle: string;
+  country: string; phone: string; custom: Row; status: string;
+} {
+  const audienceId = requiredString(body.audienceId ?? body.audience_id, "Audience", 100);
+  const email = requiredEmail(body.email, "Email");
+  const status = enumValue(body.status, ["active", "unsubscribed", "bounced", "invalid"], "active");
+  return {
+    audienceId,
+    email,
+    firstName: optionalString(body.firstName ?? body.first_name, 120),
+    lastName: optionalString(body.lastName ?? body.last_name, 120),
+    company: optionalString(body.company, 200),
+    jobTitle: optionalString(body.jobTitle ?? body.job_title, 200),
+    country: optionalString(body.country, 100),
+    phone: optionalString(body.phone, 80),
+    custom: typeof body.custom === "object" && body.custom && !Array.isArray(body.custom) ? body.custom as Row : parseJsonObject(String(body.custom_json ?? "{}")),
+    status
+  };
+}
+
+function normalizeCampaign(body: Row): {
+  name: string; audienceId: string; senderId: string; subject: string; previewText: string; htmlBody: string;
+  textBody: string; filterTagIds: string[]; scheduledAt: string | null;
+} {
+  const htmlBody = optionalString(body.htmlBody ?? body.html_body, 500_000);
+  const textBody = optionalString(body.textBody ?? body.text_body, 200_000);
+  if (!htmlBody && !textBody) throw new HttpError(400, "Add an HTML or plain-text email body.");
+  return {
+    name: requiredString(body.name, "Campaign name", 160),
+    audienceId: requiredString(body.audienceId ?? body.audience_id, "Audience", 100),
+    senderId: requiredString(body.senderId ?? body.sender_id, "Sender", 100),
+    subject: requiredString(body.subject, "Subject", 998),
+    previewText: optionalString(body.previewText ?? body.preview_text, 250),
+    htmlBody,
+    textBody,
+    filterTagIds: arrayOfStrings(body.filterTagIds ?? body.filter_tags).slice(0, 50),
+    scheduledAt: body.scheduledAt || body.scheduled_at ? normalizeDateTime(body.scheduledAt ?? body.scheduled_at) : null
+  };
+}
+
+function normalizeDateTime(value: unknown): string {
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) throw new HttpError(400, "Scheduled date and time is invalid.");
+  return date.toISOString();
+}
+
+function mergeText(template: string, data: Record<string, unknown>): string {
+  return template.replace(/{{\s*([a-zA-Z0-9_.-]+)\s*}}/g, (_match, key: string) => String(data[key] ?? ""));
+}
+
+function mergeHtml(template: string, data: Record<string, unknown>): string {
+  return template.replace(/{{\s*([a-zA-Z0-9_.-]+)\s*}}/g, (_match, key: string) => escapeHtml(data[key] ?? ""));
+}
+
+function sanitizeEmailHtml(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<(iframe|object|embed|form|meta|link)\b[\s\S]*?<\/\1>/gi, "")
+    .replace(/<(iframe|object|embed|form|meta|link)\b[^>]*\/?>/gi, "")
+    .replace(/\son[a-z]+\s*=\s*(["']).*?\1/gi, "")
+    .replace(/javascript:/gi, "");
+}
+
+function ensureUnsubscribeFooter(html: string, url: string): string {
+  if (/unsubscribe_url|\/unsubscribe\?token=/i.test(html)) return html;
+  return `${html}<div style="margin-top:32px;padding-top:20px;border-top:1px solid #e5e7eb;font:12px/1.5 Arial,sans-serif;color:#64748b;text-align:center">You can <a href="${escapeHtml(url)}" style="color:#0f766e">unsubscribe here</a>.</div>`;
+}
+
+function ensureTextUnsubscribe(text: string, url: string): string {
+  if (/\/unsubscribe\?token=/i.test(text)) return text;
+  return `${text.trim()}\n\nUnsubscribe: ${url}`;
+}
+
+function stripHtml(html: string): string {
+  return html.replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n").replace(/<\/p>/gi, "\n\n").replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/\n\s+\n/g, "\n\n").trim();
+}
+
+async function makeUnsubscribeToken(env: Env, contactId: string, campaignId: string, email: string): Promise<string> {
+  const payload = base64UrlEncode(JSON.stringify({ contactId, campaignId, email, exp: Date.now() + 1000 * 60 * 60 * 24 * 365 * 5 }));
+  const signature = await hmac(env, payload);
+  return `${payload}.${signature}`;
+}
+
+async function verifyUnsubscribeToken(env: Env, token: string): Promise<{ contactId: string; campaignId: string; email: string; exp: number }> {
+  const [payload, signature] = token.split(".");
+  if (!payload || !signature) throw new Error("Invalid token");
+  const expected = await hmac(env, payload);
+  if (!timingSafeEqual(signature, expected)) throw new Error("Invalid signature");
+  const decoded = JSON.parse(base64UrlDecode(payload)) as { contactId: string; campaignId: string; email: string; exp: number };
+  if (!decoded.email || decoded.exp < Date.now()) throw new Error("Expired token");
+  return decoded;
+}
+
+async function hmac(env: Env, value: string): Promise<string> {
+  const secret = env.UNSUBSCRIBE_SECRET;
+  if (!secret || secret.length < 24) throw new Error("UNSUBSCRIBE_SECRET must be configured with at least 24 characters.");
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
+  return base64UrlEncodeBytes(new Uint8Array(signature));
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i += 1) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
+}
+
+function base64UrlEncode(value: string): string {
+  return base64UrlEncodeBytes(new TextEncoder().encode(value));
+}
+
+function base64UrlEncodeBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64UrlDecode(value: string): string {
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - value.length % 4) % 4);
+  const binary = atob(padded);
+  return new TextDecoder().decode(Uint8Array.from(binary, (char) => char.charCodeAt(0)));
+}
+
+function matchPath(actual: string, pattern: string, params: Record<string, string>): boolean {
+  const actualParts = actual.split("/").filter(Boolean);
+  const patternParts = pattern.split("/").filter(Boolean);
+  if (actualParts.length !== patternParts.length) return false;
+  const local: Record<string, string> = {};
+  for (let index = 0; index < patternParts.length; index += 1) {
+    const expected = patternParts[index];
+    if (expected.startsWith(":")) local[expected.slice(1)] = actualParts[index];
+    else if (expected !== actualParts[index]) return false;
+  }
+  Object.assign(params, local);
+  return true;
+}
+
+async function readJson(request: Request, allowEmpty = false): Promise<Row> {
+  if (allowEmpty && !request.headers.get("content-length")) return {};
