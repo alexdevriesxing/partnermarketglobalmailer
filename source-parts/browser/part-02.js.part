@@ -1,0 +1,180 @@
+
+async function deleteContact(id) {
+  if (!confirm('Delete this contact? Historical campaign records may also be removed.')) return;
+  await api(`/api/contacts/${id}`, { method: 'DELETE' });
+  await renderCurrent(); toast('Contact deleted', 'The contact was removed.');
+}
+
+function openImport() {
+  state.importFile = null; state.importPreview = null;
+  openModal({
+    title: 'Import contact list', subtitle: 'Upload CSV, XLS or XLSX files directly into D1.', large: true,
+    body: `<form id="importForm">
+      <div class="file-drop"><strong>Choose your spreadsheet</strong><p class="cell-secondary">Maximum 15 MB and 5,000 rows by default.</p><input id="importFile" type="file" accept=".csv,.xls,.xlsx" required></div>
+      <div id="importConfiguration" hidden>
+        <div class="form-grid form-section">
+          <label class="field"><span>Destination database</span><select id="importAudience" required><option value="">Choose database</option>${options(state.audiences, state.contactsAudience)}</select></label>
+          <div class="field"><span>Apply tags</span><div class="checkbox-row">${tagCheckboxes(new Set(), 'importTagIds')}</div></div>
+        </div>
+        <div class="form-section"><h3>Column mapping</h3><div id="mappingGrid" class="mapping-grid"></div></div>
+        <div class="form-section"><h3>Preview</h3><div id="sampleTable" class="sample-table"></div></div>
+      </div>
+    </form>`,
+    footer: `<button class="button ghost" data-action="close-modal">Cancel</button><button class="button primary" id="importSubmit" type="submit" form="importForm" disabled>Import contacts</button>`
+  });
+  document.querySelector('#importFile').addEventListener('change', previewImportFile);
+  document.querySelector('#importForm').addEventListener('submit', commitImportFile);
+}
+
+async function previewImportFile(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  state.importFile = file;
+  const form = new FormData(); form.append('file', file);
+  const button = document.querySelector('#importSubmit');
+  button.disabled = true; button.textContent = 'Reading file…';
+  try {
+    const preview = await api('/api/imports/preview', { method: 'POST', body: form, rawBody: true });
+    state.importPreview = preview;
+    document.querySelector('#importConfiguration').hidden = false;
+    document.querySelector('#mappingGrid').innerHTML = mappingFields(preview.columns, preview.suggestedMapping);
+    document.querySelector('#sampleTable').innerHTML = sampleTable(preview.sample, preview.columns);
+    button.disabled = false; button.textContent = 'Import contacts';
+  } catch (error) {
+    button.textContent = 'Import contacts';
+    toast('Could not read file', error.message, 'error');
+  }
+}
+
+async function commitImportFile(event) {
+  event.preventDefault();
+  const audienceId = document.querySelector('#importAudience').value;
+  if (!audienceId) return toast('Choose a database', 'Select where these contacts should be stored.', 'error');
+  const mapping = {};
+  document.querySelectorAll('[data-map-field]').forEach(select => mapping[select.dataset.mapField] = select.value);
+  if (!mapping.email) return toast('Map the email column', 'Every import requires an email address column.', 'error');
+  const tagIds = [...document.querySelectorAll('input[name="importTagIds"]:checked')].map(input => input.value);
+  const form = new FormData();
+  form.append('file', state.importFile); form.append('audienceId', audienceId); form.append('mapping', JSON.stringify(mapping)); form.append('tagIds', JSON.stringify(tagIds));
+  const button = document.querySelector('#importSubmit');
+  button.disabled = true; button.textContent = 'Importing…';
+  try {
+    const result = await api('/api/imports/commit', { method: 'POST', body: form, rawBody: true });
+    closeModal(); await loadReferenceData(); state.contactsAudience = audienceId; await navigate('contacts');
+    toast('Import complete', `${fmt(result.rowsImported)} accepted · ${fmt(result.rowsRejected)} rejected.`);
+  } catch (error) {
+    button.disabled = false; button.textContent = 'Import contacts'; throw error;
+  }
+}
+
+function exportContacts() {
+  if (!state.contactsAudience) return;
+  window.location.href = `/api/contacts/export?audience_id=${encodeURIComponent(state.contactsAudience)}`;
+}
+
+function openSender(item = null) {
+  openModal({
+    title: item ? 'Edit sender' : 'Add sender identity', subtitle: 'Only onboarded Cloudflare Email Service domains can send.',
+    body: `<form id="senderForm" class="form-grid">
+      <label class="field"><span>Display name</span><input name="name" value="${esc(item?.name || '')}" placeholder="PartnerMarket Global" required></label>
+      <label class="field"><span>From email</span><input type="email" name="email" value="${esc(item?.email || '')}" placeholder="outreach@yourdomain.com" required></label>
+      <label class="field"><span>Reply-To email</span><input type="email" name="replyTo" value="${esc(item?.reply_to || '')}" placeholder="alex@yourdomain.com"></label>
+      <label class="field"><span>Cloudflare status</span><select name="status">${statusOptions(item?.status || 'pending', ['pending','ready','disabled'])}</select></label>
+      <label class="field wide"><span><input style="width:auto;margin-right:8px" type="checkbox" name="isDefault" ${item?.is_default ? 'checked' : ''}> Make this the default sender</span></label>
+      <div class="wide notice">Mark “ready” only after the From domain is onboarded under Cloudflare → Compute → Email Service → Email Sending.</div>
+    </form>`,
+    footer: `<button class="button ghost" data-action="close-modal">Cancel</button><button class="button primary" type="submit" form="senderForm">${item ? 'Save sender' : 'Add sender'}</button>`
+  });
+  document.querySelector('#senderForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const body = Object.fromEntries(form); body.isDefault = form.get('isDefault') === 'on';
+    await api(item ? `/api/senders/${item.id}` : '/api/senders', { method: item ? 'PATCH' : 'POST', body });
+    closeModal(); await loadReferenceData(); await renderCurrent(); toast('Sender saved', `${body.name} <${body.email}>`);
+  });
+}
+
+async function deleteSender(id) {
+  if (!confirm('Delete this sender identity?')) return;
+  await api(`/api/senders/${id}`, { method: 'DELETE' });
+  await loadReferenceData(); await renderCurrent();
+}
+
+async function openCampaign(id = null) {
+  await loadReferenceData();
+  const item = id ? await api(`/api/campaigns/${id}`) : null;
+  if (!state.audiences.length) return toast('Create a database first', 'A campaign needs an audience database.', 'error');
+  if (!state.senders.length) return toast('Add a sender first', 'Configure an authenticated From address before composing.', 'error');
+  const selectedTags = new Set(item ? JSON.parse(item.filter_tags_json || '[]') : []);
+  const defaultHtml = `<div style="max-width:640px;margin:0 auto;padding:32px;font-family:Arial,sans-serif;color:#17313a"><p style="color:#0f766e;font-weight:bold">PARTNERMARKET GLOBAL</p><h1 style="font-size:32px;line-height:1.15">Hello {{first_name}},</h1><p style="font-size:16px;line-height:1.7">Write your message here. You can personalize it with merge tags such as {{company}} and {{country}}.</p><p style="margin-top:30px">Kind regards,<br><strong>Your name</strong></p></div>`;
+  openModal({
+    title: item ? 'Edit campaign' : 'Compose campaign', subtitle: 'Personalized HTML and plain text with live preview.', large: true,
+    body: `<form id="campaignForm" class="composer-layout">
+      <div>
+        <div class="form-grid">
+          <label class="field"><span>Campaign name</span><input name="name" value="${esc(item?.name || '')}" placeholder="July partner outreach" required></label>
+          <label class="field"><span>Audience database</span><select name="audienceId" required><option value="">Choose database</option>${options(state.audiences, item?.audience_id || state.contactsAudience)}</select></label>
+          <label class="field"><span>Sender identity</span><select name="senderId" required><option value="">Choose sender</option>${state.senders.map(sender => `<option value="${esc(sender.id)}" ${sender.id === item?.sender_id || (!item && sender.is_default) ? 'selected' : ''}>${esc(sender.name)} &lt;${esc(sender.email)}&gt; · ${esc(sender.status)}</option>`).join('')}</select></label>
+          <label class="field"><span>Schedule <small>leave empty to queue now</small></span><input type="datetime-local" name="scheduledAt" value="${toLocalInput(item?.scheduled_at)}"></label>
+          <label class="field wide"><span>Subject</span><input id="campaignSubject" name="subject" value="${esc(item?.subject || '')}" placeholder="A partnership opportunity for {{company}}" required></label>
+          <label class="field wide"><span>Preview text</span><input name="previewText" value="${esc(item?.preview_text || '')}" maxlength="250"></label>
+          <div class="field wide"><span>Filter by tags <small>matches any selected tag</small></span><div class="checkbox-row">${tagCheckboxes(selectedTags, 'filterTagIds')}</div></div>
+          <label class="field wide"><span>HTML email</span><textarea id="campaignHtml" name="htmlBody" style="min-height:300px">${esc(item?.html_body || defaultHtml)}</textarea></label>
+          <label class="field wide"><span>Plain-text fallback</span><textarea name="textBody" placeholder="Optional plain text version">${esc(item?.text_body || '')}</textarea></label>
+        </div>
+        <div class="notice info" style="margin-top:14px">Merge tags: ${['first_name','last_name','full_name','email','company','job_title','country','unsubscribe_url'].map(token => `<button class="code-token" type="button" data-action="copy-token" data-token="{{${token}}}">{{${token}}}</button>`).join(' ')}</div>
+      </div>
+      <div><label class="field"><span>Live email preview</span><iframe id="campaignPreview" class="email-preview" sandbox=""></iframe></label></div>
+    </form>`,
+    footer: `<button class="button ghost" data-action="close-modal">Cancel</button><button class="button primary" type="submit" form="campaignForm">${item ? 'Save changes' : 'Save draft'}</button>`
+  });
+  const updatePreview = () => {
+    const html = document.querySelector('#campaignHtml').value
+      .replaceAll('{{first_name}}', 'Alex').replaceAll('{{last_name}}', 'de Vries').replaceAll('{{full_name}}', 'Alex de Vries')
+      .replaceAll('{{company}}', 'Example Company').replaceAll('{{country}}', 'Netherlands').replaceAll('{{email}}', 'alex@example.com')
+      .replaceAll('{{job_title}}', 'Managing Director').replaceAll('{{unsubscribe_url}}', '#');
+    document.querySelector('#campaignPreview').srcdoc = html;
+  };
+  document.querySelector('#campaignHtml').addEventListener('input', updatePreview); updatePreview();
+  document.querySelector('#campaignForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const body = Object.fromEntries(form);
+    body.filterTagIds = [...event.currentTarget.querySelectorAll('input[name="filterTagIds"]:checked')].map(input => input.value);
+    if (!body.scheduledAt) body.scheduledAt = null;
+    await api(item ? `/api/campaigns/${item.id}` : '/api/campaigns', { method: item ? 'PATCH' : 'POST', body });
+    closeModal(); await navigate('campaigns'); toast('Draft saved', body.name);
+  });
+}
+
+async function launchCampaign(id) {
+  const campaign = await api(`/api/campaigns/${id}`);
+  const scheduleText = campaign.scheduled_at ? `scheduled for ${fmtDate(campaign.scheduled_at)}` : 'queued immediately';
+  if (!confirm(`Launch “${campaign.name}”? Recipient selection will be snapshotted and ${scheduleText}.`)) return;
+  const result = await api(`/api/campaigns/${id}/launch`, { method: 'POST', body: { scheduledAt: campaign.scheduled_at || null } });
+  await renderCurrent(); toast('Campaign launched', `${fmt(result.recipients)} recipients · ${result.status}.`);
+}
+
+async function pauseCampaign(id) {
+  await api(`/api/campaigns/${id}/pause`, { method: 'POST', body: {} });
+  await renderCurrent(); toast('Campaign paused', 'Queued recipients will remain on hold.');
+}
+
+async function deleteCampaign(id) {
+  if (!confirm('Delete this draft campaign?')) return;
+  await api(`/api/campaigns/${id}`, { method: 'DELETE' }); await renderCurrent();
+}
+
+function openSuppression() {
+  openModal({
+    title: 'Suppress an email', subtitle: 'This address will be excluded from every future campaign.',
+    body: `<form id="suppressionForm" class="form-grid"><label class="field wide"><span>Email address</span><input type="email" name="email" required></label><label class="field wide"><span>Reason</span><input name="reason" placeholder="Requested removal"></label></form>`,
+    footer: `<button class="button ghost" data-action="close-modal">Cancel</button><button class="button danger" type="submit" form="suppressionForm">Suppress email</button>`
+  });
+  document.querySelector('#suppressionForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    await api('/api/suppressions', { method: 'POST', body: Object.fromEntries(new FormData(event.currentTarget)) });
+    closeModal(); await renderCurrent(); toast('Email suppressed', 'Future sends to this address are blocked.');
+  });
+}
+
