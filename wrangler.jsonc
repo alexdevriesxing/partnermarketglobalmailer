@@ -4,6 +4,16 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-07-16",
   "compatibility_flags": ["nodejs_compat"],
+  // The Cf-Access-* identity headers are forgeable on any hostname that does not
+  // transit Access, so workers.dev stays off and the Access-protected custom
+  // domain is the only route to this Worker.
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "mailer.partnermarketglobal.com",
+      "custom_domain": true
+    }
+  ],
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
@@ -14,7 +24,7 @@
     {
       "binding": "DB",
       "database_name": "partnermarket-global-mailer",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "b44ed9e3-41d2-48f9-a724-b9259a249b7b",
       "migrations_dir": "migrations"
     }
   ],
@@ -46,6 +56,12 @@
   "vars": {
     "APP_NAME": "PartnerMarket Global Mailer",
     "REQUIRE_ACCESS": "true",
+    // Only these addresses may use the mailer. An empty value locks everyone out.
+    "ADMIN_EMAILS": "alexdevriesxing@gmail.com",
+    // Both are required to verify the Access JWT. ACCESS_AUD is the Application
+    // Audience tag from the Access application; until it is set the API returns 500.
+    "ACCESS_TEAM_DOMAIN": "",
+    "ACCESS_AUD": "",
     "PUBLIC_BASE_URL": "https://mailer.partnermarketglobal.com",
     "MAX_IMPORT_ROWS": "5000",
     "SEND_BATCH_PER_MINUTE": "500"

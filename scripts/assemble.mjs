@@ -1,7 +1,8 @@
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = resolve(new URL('..', import.meta.url).pathname);
+const root = fileURLToPath(new URL('..', import.meta.url));
 
 async function assemble(sourceDirectory, outputFile) {
   const sourcePath = resolve(root, sourceDirectory);

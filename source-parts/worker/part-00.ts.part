@@ -20,6 +20,8 @@ interface Env {
   APP_NAME?: string;
   REQUIRE_ACCESS?: string;
   ADMIN_EMAILS?: string;
+  ACCESS_TEAM_DOMAIN?: string;
+  ACCESS_AUD?: string;
   PUBLIC_BASE_URL?: string;
   UNSUBSCRIBE_SECRET?: string;
   MAX_IMPORT_ROWS?: string;
@@ -52,7 +54,7 @@ export default {
     }
 
     try {
-      const actor = authorize(request, env);
+      const actor = await authorize(request, env);
       enforceSameOrigin(request, url);
       const response = await route({ request, env, ctx, url, params: {} }, actor);
       return withSecurityHeaders(response);
@@ -73,22 +75,134 @@ export default {
   }
 };
 
-function authorize(request: Request, env: Env): string {
-  const accessEmail = request.headers.get("Cf-Access-Authenticated-User-Email")?.trim().toLowerCase();
-  const accessJwt = request.headers.get("Cf-Access-Jwt-Assertion");
+async function authorize(request: Request, env: Env): Promise<string> {
   const requireAccess = (env.REQUIRE_ACCESS ?? "true").toLowerCase() === "true";
+  if (!requireAccess) {
+    // Disabling Access trusts a forgeable header, so it is confined to local dev:
+    // a stray REQUIRE_ACCESS=false in production must not silently expose the app.
+    const hostname = new URL(request.url).hostname;
+    const isLocal = hostname === "localhost" || hostname === "127.0.0.1" || hostname.endsWith(".localhost");
+    if (!isLocal) throw new HttpError(500, "REQUIRE_ACCESS may only be disabled for local development.");
+    return request.headers.get("Cf-Access-Authenticated-User-Email")?.trim().toLowerCase() || "local-admin";
+  }
 
-  if (!requireAccess) return accessEmail || "local-admin";
-  if (!accessEmail || !accessJwt) throw new HttpError(401, "Cloudflare Access authentication is required.");
+  // The Cf-Access-* headers are trivially forgeable by anyone who reaches this
+  // Worker without transiting Access, so the signed assertion is the only
+  // trustworthy identity source here.
+  const token = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (!token) throw new HttpError(401, "Cloudflare Access authentication is required.");
+
+  const claims = await verifyAccessJwt(token, env);
+  const accessEmail = String(claims.email ?? "").trim().toLowerCase();
+  if (!accessEmail) throw new HttpError(403, "Access token does not carry an email claim.");
 
   const allowed = (env.ADMIN_EMAILS ?? "")
     .split(",")
     .map((email) => email.trim().toLowerCase())
     .filter(Boolean);
-  if (allowed.length && !allowed.includes(accessEmail)) {
-    throw new HttpError(403, "This account is not authorized for the mailer.");
-  }
+  if (!allowed.length) throw new HttpError(403, "ADMIN_EMAILS is not configured, so no account is authorized.");
+  if (!allowed.includes(accessEmail)) throw new HttpError(403, "This account is not authorized for the mailer.");
   return accessEmail;
+}
+
+interface AccessJwtClaims {
+  email?: string;
+  aud?: string | string[];
+  iss?: string;
+  exp?: number;
+  nbf?: number;
+}
+
+let accessJwksCache: { keys: Map<string, CryptoKey>; expiresAt: number } | null = null;
+
+async function accessSigningKeys(teamDomain: string): Promise<Map<string, CryptoKey>> {
+  const now = Date.now();
+  if (accessJwksCache && accessJwksCache.expiresAt > now) return accessJwksCache.keys;
+
+  const response = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`);
+  if (!response.ok) throw new HttpError(503, "Unable to fetch Cloudflare Access signing keys.");
+  const body = (await response.json()) as { keys?: Array<JsonWebKey & { kid?: string }> };
+
+  const keys = new Map<string, CryptoKey>();
+  for (const jwk of body.keys ?? []) {
+    if (!jwk.kid || jwk.kty !== "RSA") continue;
+    try {
+      keys.set(
+        jwk.kid,
+        await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"])
+      );
+    } catch {
+      // Skip only the unusable key; one bad entry must not discard the whole set.
+      continue;
+    }
+  }
+  if (!keys.size) throw new HttpError(503, "Cloudflare Access returned no signing keys.");
+
+  accessJwksCache = { keys, expiresAt: now + 3_600_000 };
+  return keys;
+}
+
+async function verifyAccessJwt(token: string, env: Env): Promise<AccessJwtClaims> {
+  const teamDomain = (env.ACCESS_TEAM_DOMAIN ?? "").trim().replace(/^https?:\/\//, "").replace(/\/$/, "");
+  const audience = (env.ACCESS_AUD ?? "").trim();
+  if (!teamDomain || !audience) {
+    throw new HttpError(500, "ACCESS_TEAM_DOMAIN and ACCESS_AUD must be configured to verify Access tokens.");
+  }
+
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new HttpError(401, "Malformed Access token.");
+  const [headerPart, payloadPart, signaturePart] = parts;
+
+  const header = decodeJwtSegment<{ alg?: string; kid?: string }>(headerPart);
+  if (header.alg !== "RS256") throw new HttpError(401, "Unsupported Access token algorithm.");
+  if (!header.kid) throw new HttpError(401, "Access token is missing a key id.");
+
+  const key = (await accessSigningKeys(teamDomain)).get(header.kid);
+  if (!key) throw new HttpError(401, "Access token was signed by an unknown key.");
+
+  let signature: Uint8Array<ArrayBuffer>;
+  try {
+    signature = base64UrlDecodeBytes(signaturePart);
+  } catch {
+    throw new HttpError(401, "Malformed Access token.");
+  }
+
+  const verified = await crypto.subtle.verify(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    signature,
+    new TextEncoder().encode(`${headerPart}.${payloadPart}`)
+  );
+  if (!verified) throw new HttpError(401, "Access token signature is invalid.");
+
+  const claims = decodeJwtSegment<AccessJwtClaims>(payloadPart);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (typeof claims.exp !== "number" || claims.exp <= nowSeconds) throw new HttpError(401, "Access token has expired.");
+  if (typeof claims.nbf === "number" && claims.nbf > nowSeconds + 60) throw new HttpError(401, "Access token is not yet valid.");
+  if (claims.iss !== `https://${teamDomain}`) throw new HttpError(401, "Access token issuer is not trusted.");
+
+  const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (!audiences.includes(audience)) throw new HttpError(401, "Access token audience does not match this application.");
+  return claims;
+}
+
+// Malformed segments must read as an auth failure, never as a 500 carrying raw
+// parser text back to an unauthenticated caller.
+function decodeJwtSegment<T>(segment: string): T {
+  try {
+    return JSON.parse(new TextDecoder().decode(base64UrlDecodeBytes(segment))) as T;
+  } catch {
+    throw new HttpError(401, "Malformed Access token.");
+  }
+}
+
+function base64UrlDecodeBytes(value: string): Uint8Array<ArrayBuffer> {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(new ArrayBuffer(binary.length));
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
 }
 
 function enforceSameOrigin(request: Request, url: URL): void {
