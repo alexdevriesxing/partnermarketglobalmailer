@@ -37,7 +37,16 @@ function tagCard(item) {
 }
 
 function contactRow(item) {
-  return `<tr data-row="${encodeURIComponent(JSON.stringify(item))}"><td><div class="cell-primary">${esc([item.first_name,item.last_name].filter(Boolean).join(' ') || item.email)}</div><div class="cell-secondary">${esc(item.email)}</div></td><td><div class="cell-primary">${esc(item.company || '—')}</div><div class="cell-secondary">${esc(item.job_title || '')}</div></td><td>${esc(item.audience_name)}</td><td>${esc(item.country || '—')}</td><td>${item.tags ? item.tags.split(', ').map(tag => `<span class="badge">${esc(tag)}</span>`).join(' ') : '—'}</td><td>${statusBadge(item.status)}</td><td><div class="table-actions"><button class="button small ghost" data-action="edit-contact" data-id="${esc(item.id)}">Edit</button><button class="button small danger" data-action="delete-contact" data-id="${esc(item.id)}">Delete</button></div></td></tr>`;
+  return `<tr data-row="${encodeURIComponent(JSON.stringify(item))}"><td><input type="checkbox" name="selectContact" value="${esc(item.id)}" ${state.contactsSelection.has(item.id) ? 'checked' : ''}></td><td><div class="cell-primary">${esc([item.first_name,item.last_name].filter(Boolean).join(' ') || item.email)}</div><div class="cell-secondary">${esc(item.email)}</div></td><td><div class="cell-primary">${esc(item.company || '—')}</div><div class="cell-secondary">${esc(item.country || '')}</div></td><td>${esc(item.audience_name)}</td><td>${item.tags ? item.tags.split(', ').map(tag => `<span class="badge">${esc(tag)}</span>`).join(' ') : '—'}</td><td>${engagementCell(item)}</td><td>${statusBadge(item.status)}</td><td><div class="table-actions"><button class="button small ghost" data-action="contact-activity" data-id="${esc(item.id)}">Activity</button><button class="button small ghost" data-action="edit-contact" data-id="${esc(item.id)}">Edit</button><button class="button small danger" data-action="delete-contact" data-id="${esc(item.id)}">Delete</button></div></td></tr>`;
+}
+
+function engagementCell(item) {
+  const received = Number(item.received_campaigns || 0);
+  if (!received) return '<span class="cell-secondary">Never contacted</span>';
+  const opened = Number(item.opened_campaigns || 0);
+  const clicked = Number(item.clicked_campaigns || 0);
+  if (!opened) return `<div class="cell-secondary">${fmt(received)} sent · no opens</div>`;
+  return `<div class="cell-primary">${fmt(opened)}/${fmt(received)} opened</div><div class="cell-secondary">${clicked ? `${fmt(clicked)} clicked · ` : ''}${item.last_engaged_at ? fmtDate(item.last_engaged_at) : ''}</div>`;
 }
 
 function campaignCard(item) {

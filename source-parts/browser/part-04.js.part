@@ -1,0 +1,200 @@
+
+// ---------------------------------------------------------------------------
+// Analytics
+// ---------------------------------------------------------------------------
+
+// statCard runs its value through fmt(), which would turn "12.5%" into NaN, so
+// pre-formatted values need their own card.
+function textStatCard(label, value, detail) {
+  return `<article class="stat-card"><label>${esc(label)}</label><strong>${esc(value)}</strong><small>${esc(detail)}</small></article>`;
+}
+
+async function renderAnalytics() {
+  if (state.analyticsCampaign) return renderCampaignAnalytics(state.analyticsCampaign);
+
+  const data = await api(`/api/analytics?days=${state.analyticsDays}`);
+  const rows = data.campaigns.length
+    ? data.campaigns.map(analyticsCampaignRow).join('')
+    : emptyTableRow(7, 'No campaigns have been sent yet. Analytics appear once your first send completes.');
+  const links = data.topLinks.length
+    ? data.topLinks.map((link) => `<tr><td class="cell-primary" style="word-break:break-all">${esc(link.url)}</td><td>${fmt(link.clicks)}</td><td>${fmt(link.unique_clicks)}</td></tr>`).join('')
+    : emptyTableRow(3, 'No link clicks recorded yet.');
+
+  content.innerHTML = `
+    <div class="section-heading">
+      <div><h2>Engagement intelligence</h2><p>Opens, clicks and link performance across every campaign.</p></div>
+      <div class="section-actions">
+        <select id="analyticsRange">
+          ${[7, 30, 90, 365].map((days) => `<option value="${days}" ${days === state.analyticsDays ? 'selected' : ''}>Last ${days} days</option>`).join('')}
+        </select>
+        <button class="button ghost" data-action="refresh">↻ Refresh</button>
+      </div>
+    </div>
+    <section class="stat-grid">
+      ${statCard('Emails sent', data.totals.sent, 'Successful deliveries')}
+      ${statCard('Unique opens', data.engagement.uniqueOpens, `${data.rates.openRate}% open rate`)}
+      ${statCard('Unique clicks', data.engagement.uniqueClicks, `${data.rates.clickRate}% click rate`)}
+      ${textStatCard('Click to open', `${data.rates.clickToOpenRate}%`, 'Openers who clicked')}
+      ${statCard('Unsubscribes', data.engagement.unsubscribes, `${data.rates.unsubscribeRate}% of sends`)}
+    </section>
+    <section class="panel">
+      <div class="panel-header"><div><h2>Activity over time</h2><p>Sends, opens and clicks in the last ${data.days} days</p></div></div>
+      <div class="panel-body">${timelineChart(data.timeline)}</div>
+    </section>
+    <section class="grid-2">
+      <div class="panel">
+        <div class="panel-header"><div><h2>Campaign performance</h2><p>Select a campaign for a full breakdown</p></div></div>
+        <div class="table-wrap"><table><thead><tr><th>Campaign</th><th>Status</th><th>Sent</th><th>Opens</th><th>Open rate</th><th>Clicks</th><th>Click rate</th></tr></thead><tbody>${rows}</tbody></table></div>
+      </div>
+      <div class="panel">
+        <div class="panel-header"><div><h2>Top links</h2><p>Most clicked destinations</p></div></div>
+        <div class="table-wrap"><table><thead><tr><th>Link</th><th>Clicks</th><th>Unique</th></tr></thead><tbody>${links}</tbody></table></div>
+      </div>
+    </section>`;
+
+  document.querySelector('#analyticsRange').addEventListener('change', (event) => {
+    state.analyticsDays = Number(event.target.value);
+    renderAnalytics();
+  });
+  content.querySelectorAll('[data-campaign-analytics]').forEach((node) => {
+    node.addEventListener('click', () => {
+      state.analyticsCampaign = node.dataset.campaignAnalytics;
+      renderAnalytics();
+    });
+  });
+}
+
+function analyticsCampaignRow(row) {
+  return `<tr data-campaign-analytics="${esc(row.id)}" style="cursor:pointer">
+    <td><div class="cell-primary">${esc(row.name)}</div><div class="cell-secondary">${esc(row.subject)}</div></td>
+    <td>${statusBadge(row.status)}</td>
+    <td>${fmt(row.sent)}</td>
+    <td>${fmt(row.unique_opens)}</td>
+    <td>${rateBar(row.openRate)}</td>
+    <td>${fmt(row.unique_clicks)}</td>
+    <td>${rateBar(row.clickRate)}</td>
+  </tr>`;
+}
+
+async function renderCampaignAnalytics(campaignId) {
+  const data = await api(`/api/campaigns/${campaignId}/analytics`);
+  const links = data.links.length
+    ? data.links.map((link) => `<tr><td class="cell-primary" style="word-break:break-all">${esc(link.url)}</td><td>${fmt(link.clicks)}</td><td>${fmt(link.unique_clicks)}</td></tr>`).join('')
+    : emptyTableRow(3, 'No clicks recorded for this campaign yet.');
+
+  const tracking = [];
+  if (!Number(data.campaign.track_opens)) tracking.push('open tracking off');
+  if (!Number(data.campaign.track_clicks)) tracking.push('click tracking off');
+
+  content.innerHTML = `
+    <div class="section-heading">
+      <div><h2>${esc(data.campaign.name)}</h2><p>${esc(data.campaign.subject)}${tracking.length ? ` · ${esc(tracking.join(', '))}` : ''}</p></div>
+      <div class="section-actions"><button class="button ghost" id="backToAnalytics">← All campaigns</button></div>
+    </div>
+    <section class="stat-grid">
+      ${statCard('Recipients', data.stats.recipients, 'In this campaign')}
+      ${statCard('Sent', data.stats.sent, `${fmt(data.stats.failed)} failed`)}
+      ${statCard('Unique opens', data.engagement.uniqueOpens, `${data.rates.openRate}% open rate`)}
+      ${statCard('Unique clicks', data.engagement.uniqueClicks, `${data.rates.clickRate}% click rate`)}
+      ${statCard('Unsubscribes', data.engagement.unsubscribes, `${data.rates.unsubscribeRate}% of sends`)}
+    </section>
+    <section class="panel">
+      <div class="panel-header"><div><h2>Activity over time</h2><p>Total opens ${fmt(data.engagement.opens)} · total clicks ${fmt(data.engagement.clicks)}</p></div></div>
+      <div class="panel-body">${timelineChart(data.timeline)}</div>
+    </section>
+    <section class="panel">
+      <div class="panel-header"><div><h2>Link performance</h2><p>Which links earned the clicks</p></div></div>
+      <div class="table-wrap"><table><thead><tr><th>Link</th><th>Clicks</th><th>Unique</th></tr></thead><tbody>${links}</tbody></table></div>
+    </section>`;
+
+  document.querySelector('#backToAnalytics').addEventListener('click', () => {
+    state.analyticsCampaign = null;
+    renderAnalytics();
+  });
+}
+
+// A per-contact history, so a contact reads like a CRM record rather than a row.
+async function showContactActivity(contactId) {
+  openModal({ title: 'Contact activity', subtitle: 'Loading…', body: loading(), footer: '<button class="button ghost" data-action="close-modal">Close</button>' });
+
+  try {
+    const data = await api(`/api/contacts/${contactId}/activity`);
+    const name = [data.contact.first_name, data.contact.last_name].filter(Boolean).join(' ') || data.contact.email;
+    const events = data.events.length
+      ? data.events.map(activityRow).join('')
+      : emptyTableRow(3, 'No activity recorded for this contact yet.');
+
+    openModal({
+      title: name,
+      subtitle: data.contact.email,
+      large: true,
+      body: `<section class="stat-grid" style="margin-bottom:16px">
+          ${statCard('Received', data.summary.campaigns_received, 'Campaigns sent')}
+          ${statCard('Opened', data.summary.campaigns_opened, 'Campaigns opened')}
+          ${statCard('Clicked', data.summary.campaigns_clicked, 'Campaigns clicked')}
+        </section>
+        <div class="table-wrap"><table><thead><tr><th>Event</th><th>Campaign</th><th>When</th></tr></thead><tbody>${events}</tbody></table></div>`,
+      footer: '<button class="button ghost" data-action="close-modal">Close</button>'
+    });
+  } catch (error) {
+    openModal({
+      title: 'Could not load activity',
+      body: `<p class="cell-secondary">${esc(error.message || String(error))}</p>`,
+      footer: '<button class="button ghost" data-action="close-modal">Close</button>'
+    });
+  }
+}
+
+function activityRow(event) {
+  const meta = (() => { try { return JSON.parse(event.metadata_json || '{}'); } catch { return {}; } })();
+  const detail = meta.url ? `<div class="cell-secondary" style="word-break:break-all">${esc(meta.url)}</div>` : '';
+  return `<tr><td>${statusBadge(event.type)}${detail}</td><td>${esc(event.campaign_name || '—')}</td><td>${fmtDate(event.created_at)}</td></tr>`;
+}
+
+function rateBar(rate) {
+  const value = Math.max(0, Math.min(100, Number(rate) || 0));
+  return `<div style="display:flex;align-items:center;gap:8px">
+    <div style="flex:1;min-width:44px;height:6px;border-radius:99px;background:var(--line);overflow:hidden">
+      <div style="width:${value}%;height:100%;background:var(--accent)"></div>
+    </div>
+    <span style="font-size:12px;color:var(--muted);min-width:38px">${value}%</span>
+  </div>`;
+}
+
+// Inline SVG keeps the dashboard dependency-free, which matters because a strict
+// CSP and no bundler mean a charting library would be more trouble than it saves.
+function timelineChart(timeline) {
+  if (!timeline?.length) return '<div class="empty-state" style="padding:30px"><p>No activity recorded in this period yet.</p></div>';
+
+  const series = { sent: new Map(), open: new Map(), click: new Map() };
+  const days = [...new Set(timeline.map((row) => row.day))].sort();
+  for (const row of timeline) {
+    if (series[row.type]) series[row.type].set(row.day, Number(row.count));
+  }
+
+  const peak = Math.max(1, ...timeline.filter((row) => series[row.type]).map((row) => Number(row.count)));
+  const width = 100;
+  const height = 34;
+  const step = days.length > 1 ? width / (days.length - 1) : 0;
+
+  const path = (map) => days
+    .map((day, index) => `${index === 0 ? 'M' : 'L'}${(index * step).toFixed(2)},${(height - (map.get(day) ?? 0) / peak * height).toFixed(2)}`)
+    .join(' ');
+
+  const colors = { sent: 'var(--muted)', open: 'var(--accent)', click: 'var(--success)' };
+  const lines = Object.entries(series)
+    .filter(([, map]) => map.size)
+    .map(([key, map]) => `<path d="${path(map)}" fill="none" stroke="${colors[key]}" stroke-width="0.8" vector-effect="non-scaling-stroke" />`)
+    .join('');
+
+  const legend = Object.entries(series)
+    .filter(([, map]) => map.size)
+    .map(([key, map]) => `<span style="display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)"><span style="width:9px;height:2px;background:${colors[key]};display:inline-block"></span>${key} (${fmt([...map.values()].reduce((sum, value) => sum + value, 0))})</span>`)
+    .join('');
+
+  return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="width:100%;height:150px;display:block" role="img" aria-label="Activity over time">${lines}</svg>
+    <div style="display:flex;gap:16px;justify-content:space-between;margin-top:10px;flex-wrap:wrap">
+      <div style="display:flex;gap:14px;flex-wrap:wrap">${legend}</div>
+      <span style="font-size:11px;color:var(--muted)">${esc(days[0])} → ${esc(days[days.length - 1])}</span>
+    </div>`;
+}

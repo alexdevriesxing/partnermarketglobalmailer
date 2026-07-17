@@ -14,11 +14,17 @@
       "custom_domain": true
     }
   ],
+  // Without this, `wrangler dev` builds request URLs from the route above, so the
+  // Worker would see the production hostname locally and refuse to start with
+  // REQUIRE_ACCESS=false.
+  "dev": {
+    "host": "localhost"
+  },
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*", "/unsubscribe*"]
+    "run_worker_first": ["/api/*", "/unsubscribe*", "/t/*"]
   },
   "d1_databases": [
     {

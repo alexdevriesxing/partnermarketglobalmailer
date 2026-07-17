@@ -14,13 +14,22 @@ const state = {
   contactsPage: 1,
   contactsSearch: '',
   contactsAudience: '',
-  contactsTag: '',
+  contactsTags: [],
+  contactsTagMatch: 'any',
+  contactsEngagement: '',
+  contactsStatus: '',
+  contactsSort: 'created_at',
+  contactsDirection: 'desc',
+  contactsSelection: new Set(),
+  analyticsDays: 30,
+  analyticsCampaign: null,
   importFile: null,
   importPreview: null
 };
 
 const viewMeta = {
   dashboard: ['COMMAND CENTER', 'Overview'],
+  analytics: ['ENGAGEMENT INTELLIGENCE', 'Analytics'],
   audiences: ['AUDIENCE ARCHITECTURE', 'Databases'],
   contacts: ['CONTACT INTELLIGENCE', 'Contacts'],
   campaigns: ['OUTREACH OPERATIONS', 'Campaigns'],
@@ -100,6 +109,7 @@ async function handleAction(name, id, element) {
     'close-modal': closeModal,
     'export-contacts': exportContacts,
     'refresh': () => renderCurrent(),
+    'contact-activity': () => showContactActivity(element.dataset.id),
     'previous-page': () => changeContactsPage(-1),
     'next-page': () => changeContactsPage(1),
     'copy-token': () => copyToken(element.dataset.token)
@@ -120,6 +130,7 @@ async function navigate(view) {
 async function renderCurrent() {
   const renderers = {
     dashboard: renderDashboard,
+    analytics: renderAnalytics,
     audiences: renderAudiences,
     contacts: renderContacts,
     campaigns: renderCampaigns,

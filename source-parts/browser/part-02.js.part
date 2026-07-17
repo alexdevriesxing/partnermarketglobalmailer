@@ -119,6 +119,10 @@ async function openCampaign(id = null) {
           <label class="field wide"><span>Subject</span><input id="campaignSubject" name="subject" value="${esc(item?.subject || '')}" placeholder="A partnership opportunity for {{company}}" required></label>
           <label class="field wide"><span>Preview text</span><input name="previewText" value="${esc(item?.preview_text || '')}" maxlength="250"></label>
           <div class="field wide"><span>Filter by tags <small>matches any selected tag</small></span><div class="checkbox-row">${tagCheckboxes(selectedTags, 'filterTagIds')}</div></div>
+          <div class="field wide"><span>Tracking <small>opens use an invisible pixel; clicks redirect through your domain</small></span><div class="checkbox-row">
+            <label class="checkbox-pill"><input type="checkbox" name="trackOpens" ${item && !Number(item.track_opens) ? '' : 'checked'}><span>Track opens</span></label>
+            <label class="checkbox-pill"><input type="checkbox" name="trackClicks" ${item && !Number(item.track_clicks) ? '' : 'checked'}><span>Track clicks</span></label>
+          </div></div>
           <label class="field wide"><span>HTML email</span><textarea id="campaignHtml" name="htmlBody" style="min-height:300px">${esc(item?.html_body || defaultHtml)}</textarea></label>
           <label class="field wide"><span>Plain-text fallback</span><textarea name="textBody" placeholder="Optional plain text version">${esc(item?.text_body || '')}</textarea></label>
         </div>
@@ -141,6 +145,10 @@ async function openCampaign(id = null) {
     const form = new FormData(event.currentTarget);
     const body = Object.fromEntries(form);
     body.filterTagIds = [...event.currentTarget.querySelectorAll('input[name="filterTagIds"]:checked')].map(input => input.value);
+    // An unchecked box is absent from FormData, so read the controls directly:
+    // otherwise turning tracking off would silently fall back to the default of on.
+    body.trackOpens = event.currentTarget.querySelector('input[name="trackOpens"]').checked;
+    body.trackClicks = event.currentTarget.querySelector('input[name="trackClicks"]').checked;
     if (!body.scheduledAt) body.scheduledAt = null;
     await api(item ? `/api/campaigns/${item.id}` : '/api/campaigns', { method: item ? 'PATCH' : 'POST', body });
     closeModal(); await navigate('campaigns'); toast('Draft saved', body.name);

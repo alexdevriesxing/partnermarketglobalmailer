@@ -1,0 +1,204 @@
+
+// ---------------------------------------------------------------------------
+// Analytics
+// ---------------------------------------------------------------------------
+
+// A click proves the message was opened, so unique opens count anyone who did
+// either. Without that, pixel blocking (Apple Mail Privacy Protection and
+// friends) makes the open rate read lower than the click rate.
+const ENGAGED_TYPES = "('open', 'click')";
+
+interface EngagementCounts {
+  opens: number;
+  clicks: number;
+  uniqueOpens: number;
+  uniqueClicks: number;
+  unsubscribes: number;
+}
+
+async function campaignEngagement(env: Env, campaignId: string): Promise<EngagementCounts> {
+  const row = await env.DB.prepare(`
+    SELECT
+      SUM(CASE WHEN type = 'open' THEN 1 ELSE 0 END) AS opens,
+      SUM(CASE WHEN type = 'click' THEN 1 ELSE 0 END) AS clicks,
+      COUNT(DISTINCT CASE WHEN type IN ${ENGAGED_TYPES} THEN contact_id END) AS unique_opens,
+      COUNT(DISTINCT CASE WHEN type = 'click' THEN contact_id END) AS unique_clicks,
+      COUNT(DISTINCT CASE WHEN type = 'unsubscribed' THEN contact_id END) AS unsubscribes
+    FROM events WHERE campaign_id = ?
+  `).bind(campaignId).first<Row>();
+
+  return {
+    opens: Number(row?.opens ?? 0),
+    clicks: Number(row?.clicks ?? 0),
+    uniqueOpens: Number(row?.unique_opens ?? 0),
+    uniqueClicks: Number(row?.unique_clicks ?? 0),
+    unsubscribes: Number(row?.unsubscribes ?? 0)
+  };
+}
+
+function engagementRates(sent: number, engagement: EngagementCounts): Record<string, number> {
+  const rate = (value: number) => (sent > 0 ? Math.round((value / sent) * 1000) / 10 : 0);
+  return {
+    openRate: rate(engagement.uniqueOpens),
+    clickRate: rate(engagement.uniqueClicks),
+    unsubscribeRate: rate(engagement.unsubscribes),
+    // Of the people who opened, how many clicked. The number marketers actually
+    // use to judge whether the content earned the click.
+    clickToOpenRate: engagement.uniqueOpens > 0
+      ? Math.round((engagement.uniqueClicks / engagement.uniqueOpens) * 1000) / 10
+      : 0
+  };
+}
+
+async function campaignAnalytics(env: Env, campaignId: string): Promise<Response> {
+  const campaign = await env.DB.prepare("SELECT id, name, subject, status, track_opens, track_clicks, created_at FROM campaigns WHERE id = ?")
+    .bind(campaignId).first<Row>();
+  if (!campaign) throw new HttpError(404, "Campaign not found.");
+
+  const [stats, engagement, links, timeline] = await Promise.all([
+    campaignStats(env, campaignId),
+    campaignEngagement(env, campaignId),
+    topLinks(env, campaignId),
+    campaignTimeline(env, campaignId)
+  ]);
+
+  return json({
+    campaign,
+    stats,
+    engagement,
+    rates: engagementRates(Number(stats.sent ?? 0), engagement),
+    links,
+    timeline
+  });
+}
+
+async function topLinks(env: Env, campaignId: string): Promise<Row[]> {
+  const result = await env.DB.prepare(`
+    SELECT l.url,
+      COUNT(*) AS clicks,
+      COUNT(DISTINCT e.contact_id) AS unique_clicks
+    FROM events e
+    JOIN campaign_links l ON l.id = json_extract(e.metadata_json, '$.linkId')
+    WHERE e.campaign_id = ? AND e.type = 'click'
+    GROUP BY l.id
+    ORDER BY clicks DESC
+    LIMIT 25
+  `).bind(campaignId).all<Row>();
+  return result.results;
+}
+
+async function campaignTimeline(env: Env, campaignId: string): Promise<Row[]> {
+  const result = await env.DB.prepare(`
+    SELECT date(created_at) AS day, type, COUNT(*) AS count
+    FROM events
+    WHERE campaign_id = ? AND type IN ('sent', 'open', 'click', 'unsubscribed')
+    GROUP BY day, type
+    ORDER BY day
+  `).bind(campaignId).all<Row>();
+  return result.results;
+}
+
+// Account-wide analytics for the dashboard.
+async function analyticsOverview(env: Env, url: URL): Promise<Response> {
+  const days = Math.min(365, Math.max(7, Number(url.searchParams.get("days") ?? 30)));
+  const since = `-${days} days`;
+
+  const [totals, engagement, timeline, campaigns, links] = await Promise.all([
+    env.DB.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM contacts WHERE status = 'active') AS active_contacts,
+        (SELECT COUNT(*) FROM contacts) AS total_contacts,
+        (SELECT COUNT(*) FROM audiences) AS audiences,
+        (SELECT COUNT(*) FROM tags) AS tags,
+        (SELECT COUNT(*) FROM campaigns) AS campaigns,
+        (SELECT COUNT(*) FROM suppressions) AS suppressed,
+        (SELECT COUNT(*) FROM campaign_recipients WHERE status = 'sent') AS sent,
+        (SELECT COUNT(*) FROM campaign_recipients WHERE status = 'failed') AS failed
+    `).first<Row>(),
+    env.DB.prepare(`
+      SELECT
+        SUM(CASE WHEN type = 'open' THEN 1 ELSE 0 END) AS opens,
+        SUM(CASE WHEN type = 'click' THEN 1 ELSE 0 END) AS clicks,
+        COUNT(DISTINCT CASE WHEN type IN ${ENGAGED_TYPES} THEN contact_id END) AS unique_opens,
+        COUNT(DISTINCT CASE WHEN type = 'click' THEN contact_id END) AS unique_clicks,
+        COUNT(DISTINCT CASE WHEN type = 'unsubscribed' THEN contact_id END) AS unsubscribes
+      FROM events
+    `).first<Row>(),
+    env.DB.prepare(`
+      SELECT date(created_at) AS day, type, COUNT(*) AS count
+      FROM events
+      WHERE created_at >= datetime('now', ?) AND type IN ('sent', 'open', 'click', 'unsubscribed')
+      GROUP BY day, type
+      ORDER BY day
+    `).bind(since).all<Row>(),
+    env.DB.prepare(`
+      SELECT c.id, c.name, c.subject, c.status, c.created_at,
+        (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.id AND r.status = 'sent') AS sent,
+        (SELECT COUNT(DISTINCT e.contact_id) FROM events e WHERE e.campaign_id = c.id AND e.type IN ${ENGAGED_TYPES}) AS unique_opens,
+        (SELECT COUNT(DISTINCT e.contact_id) FROM events e WHERE e.campaign_id = c.id AND e.type = 'click') AS unique_clicks
+      FROM campaigns c
+      WHERE c.status IN ('sending', 'completed', 'paused')
+      ORDER BY c.created_at DESC
+      LIMIT 20
+    `).all<Row>(),
+    env.DB.prepare(`
+      SELECT l.url, COUNT(*) AS clicks, COUNT(DISTINCT e.contact_id) AS unique_clicks
+      FROM events e
+      JOIN campaign_links l ON l.id = json_extract(e.metadata_json, '$.linkId')
+      WHERE e.type = 'click' AND e.created_at >= datetime('now', ?)
+      GROUP BY l.url
+      ORDER BY clicks DESC
+      LIMIT 10
+    `).bind(since).all<Row>()
+  ]);
+
+  const sent = Number(totals?.sent ?? 0);
+  const counts: EngagementCounts = {
+    opens: Number(engagement?.opens ?? 0),
+    clicks: Number(engagement?.clicks ?? 0),
+    uniqueOpens: Number(engagement?.unique_opens ?? 0),
+    uniqueClicks: Number(engagement?.unique_clicks ?? 0),
+    unsubscribes: Number(engagement?.unsubscribes ?? 0)
+  };
+
+  return json({
+    days,
+    totals: Object.fromEntries(Object.entries(totals ?? {}).map(([key, value]) => [key, Number(value ?? 0)])),
+    engagement: counts,
+    rates: engagementRates(sent, counts),
+    timeline: timeline.results,
+    campaigns: campaigns.results.map((row) => ({
+      ...row,
+      openRate: Number(row.sent) > 0 ? Math.round((Number(row.unique_opens) / Number(row.sent)) * 1000) / 10 : 0,
+      clickRate: Number(row.sent) > 0 ? Math.round((Number(row.unique_clicks) / Number(row.sent)) * 1000) / 10 : 0
+    })),
+    topLinks: links.results
+  });
+}
+
+// Per-contact activity feed, so a contact record reads like a CRM timeline.
+async function contactActivity(env: Env, contactId: string): Promise<Response> {
+  const contact = await env.DB.prepare("SELECT id, email, first_name, last_name FROM contacts WHERE id = ?")
+    .bind(contactId).first<Row>();
+  if (!contact) throw new HttpError(404, "Contact not found.");
+
+  const events = await env.DB.prepare(`
+    SELECT e.type, e.created_at, e.metadata_json, c.name AS campaign_name, c.id AS campaign_id
+    FROM events e
+    LEFT JOIN campaigns c ON c.id = e.campaign_id
+    WHERE e.contact_id = ?
+    ORDER BY e.created_at DESC
+    LIMIT 200
+  `).bind(contactId).all<Row>();
+
+  const summary = await env.DB.prepare(`
+    SELECT
+      COUNT(DISTINCT CASE WHEN type = 'sent' THEN campaign_id END) AS campaigns_received,
+      COUNT(DISTINCT CASE WHEN type IN ${ENGAGED_TYPES} THEN campaign_id END) AS campaigns_opened,
+      COUNT(DISTINCT CASE WHEN type = 'click' THEN campaign_id END) AS campaigns_clicked,
+      MAX(CASE WHEN type IN ${ENGAGED_TYPES} THEN created_at END) AS last_engaged_at
+    FROM events WHERE contact_id = ?
+  `).bind(contactId).first<Row>();
+
+  return json({ contact, summary, events: events.results });
+}

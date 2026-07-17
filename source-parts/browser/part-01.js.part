@@ -17,37 +17,149 @@ async function renderAudiences() {
     </section>`;
 }
 
-async function renderContacts() {
+const ENGAGEMENT_FILTERS = [
+  ['', 'Any engagement'],
+  ['opened', 'Opened something'],
+  ['clicked', 'Clicked something'],
+  ['not_opened', 'Sent but never opened'],
+  ['never_contacted', 'Never contacted']
+];
+
+const CONTACT_SORT_OPTIONS = [
+  ['created_at', 'Date added'],
+  ['last_engaged_at', 'Last engaged'],
+  ['opened_campaigns', 'Campaigns opened'],
+  ['clicked_campaigns', 'Campaigns clicked'],
+  ['email', 'Email'],
+  ['first_name', 'First name'],
+  ['last_name', 'Last name'],
+  ['company', 'Company'],
+  ['country', 'Country'],
+  ['status', 'Status']
+];
+
+function contactsQuery() {
   const query = new URLSearchParams({ page: state.contactsPage, page_size: 50 });
   if (state.contactsSearch) query.set('search', state.contactsSearch);
   if (state.contactsAudience) query.set('audience_id', state.contactsAudience);
-  if (state.contactsTag) query.set('tag_id', state.contactsTag);
-  const data = await api(`/api/contacts?${query}`);
-  const rows = data.rows.length ? data.rows.map(contactRow).join('') : emptyTableRow(7, 'No contacts match this view.');
+  if (state.contactsStatus) query.set('status', state.contactsStatus);
+  if (state.contactsEngagement) query.set('engagement', state.contactsEngagement);
+  if (state.contactsTags.length) {
+    query.set('tag_ids', state.contactsTags.join(','));
+    query.set('tag_match', state.contactsTagMatch);
+  }
+  query.set('sort', state.contactsSort);
+  query.set('direction', state.contactsDirection);
+  return query;
+}
+
+async function renderContacts() {
+  const data = await api(`/api/contacts?${contactsQuery()}`);
+  const rows = data.rows.length ? data.rows.map(contactRow).join('') : emptyTableRow(8, 'No contacts match this view.');
+  const selected = state.contactsSelection.size;
+
   content.innerHTML = `
-    <div class="section-heading"><div><h2>Contact intelligence</h2><p>Search, filter, classify and maintain every recipient.</p></div><div class="section-actions"><button class="button ghost" data-action="export-contacts" ${state.contactsAudience ? '' : 'disabled'}>↓ Export CSV</button><button class="button ghost" data-action="import">⇧ Import</button><button class="button primary" data-action="new-contact">＋ New contact</button></div></div>
+    <div class="section-heading"><div><h2>Contact intelligence</h2><p>Search, segment, tag and maintain every recipient.</p></div><div class="section-actions"><button class="button ghost" data-action="export-contacts" ${state.contactsAudience ? '' : 'disabled'}>↓ Export CSV</button><button class="button ghost" data-action="import">⇧ Import</button><button class="button primary" data-action="new-contact">＋ New contact</button></div></div>
     <div class="panel">
       <div class="panel-body">
         <div class="toolbar">
           <div class="toolbar-group">
             <div class="search"><input id="contactSearch" value="${esc(state.contactsSearch)}" placeholder="Search email, name, company or country"></div>
             <select id="contactAudience"><option value="">All databases</option>${options(state.audiences, state.contactsAudience)}</select>
-            <select id="contactTag"><option value="">All tags</option>${options(state.tags, state.contactsTag)}</select>
+            <select id="contactStatus"><option value="">Any status</option>${['active', 'unsubscribed', 'bounced'].map((value) => `<option value="${value}" ${value === state.contactsStatus ? 'selected' : ''}>${value.charAt(0).toUpperCase() + value.slice(1)}</option>`).join('')}</select>
+            <select id="contactEngagement">${ENGAGEMENT_FILTERS.map(([value, label]) => `<option value="${value}" ${value === state.contactsEngagement ? 'selected' : ''}>${esc(label)}</option>`).join('')}</select>
+            <select id="contactSort">${CONTACT_SORT_OPTIONS.map(([value, label]) => `<option value="${value}" ${value === state.contactsSort ? 'selected' : ''}>Sort: ${esc(label)}</option>`).join('')}</select>
+            <button class="button small ghost" id="contactDirection" title="Toggle sort direction">${state.contactsDirection === 'asc' ? '↑ Ascending' : '↓ Descending'}</button>
           </div>
           <span class="badge"><span class="dot"></span>${fmt(data.total)} contacts</span>
         </div>
+        ${state.tags.length ? `<div class="toolbar" style="margin-top:12px">
+          <div class="toolbar-group" style="flex-wrap:wrap">
+            <span class="cell-secondary">Tags:</span>
+            ${state.tags.map((tag) => `<label class="checkbox-pill"><input type="checkbox" name="filterTag" value="${esc(tag.id)}" ${state.contactsTags.includes(tag.id) ? 'checked' : ''}><span>${esc(tag.name)}</span></label>`).join('')}
+            ${state.contactsTags.length > 1 ? `<button class="button small ghost" id="tagMatchToggle">Match: ${state.contactsTagMatch === 'all' ? 'all tags' : 'any tag'}</button>` : ''}
+            ${state.contactsTags.length ? '<button class="button small ghost" id="clearTags">Clear tags</button>' : ''}
+          </div>
+        </div>` : ''}
+        ${selected ? `<div class="toolbar" style="margin-top:12px">
+          <div class="toolbar-group" style="flex-wrap:wrap">
+            <strong style="font-size:12px">${fmt(selected)} selected</strong>
+            <select id="bulkTag"><option value="">Choose a tag…</option>${options(state.tags)}</select>
+            <button class="button small primary" id="bulkTagAdd">＋ Add tag</button>
+            <button class="button small ghost" id="bulkTagRemove">− Remove tag</button>
+            <button class="button small ghost" id="clearSelection">Clear selection</button>
+          </div>
+        </div>` : ''}
       </div>
-      <div class="table-wrap"><table><thead><tr><th>Contact</th><th>Company</th><th>Database</th><th>Country</th><th>Tags</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th style="width:34px"><input type="checkbox" id="selectAll" ${data.rows.length && data.rows.every((row) => state.contactsSelection.has(row.id)) ? 'checked' : ''}></th><th>Contact</th><th>Company</th><th>Database</th><th>Tags</th><th>Engagement</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
     </div>
     <div class="pagination"><span>Page ${data.page} · ${fmt(data.total)} total</span><div class="section-actions"><button class="button small ghost" data-action="previous-page" ${data.page <= 1 ? 'disabled' : ''}>← Previous</button><button class="button small ghost" data-action="next-page" ${data.page * data.pageSize >= data.total ? 'disabled' : ''}>Next →</button></div></div>`;
+
+  bindContactControls(data);
+}
+
+function bindContactControls(data) {
+  const reload = () => { state.contactsPage = 1; renderContacts(); };
 
   let searchTimer;
   document.querySelector('#contactSearch').addEventListener('input', (event) => {
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => { state.contactsSearch = event.target.value; state.contactsPage = 1; renderContacts(); }, 320);
+    searchTimer = setTimeout(() => { state.contactsSearch = event.target.value; reload(); }, 320);
   });
-  document.querySelector('#contactAudience').addEventListener('change', (event) => { state.contactsAudience = event.target.value; state.contactsPage = 1; renderContacts(); });
-  document.querySelector('#contactTag').addEventListener('change', (event) => { state.contactsTag = event.target.value; state.contactsPage = 1; renderContacts(); });
+  document.querySelector('#contactAudience').addEventListener('change', (event) => { state.contactsAudience = event.target.value; reload(); });
+  document.querySelector('#contactStatus').addEventListener('change', (event) => { state.contactsStatus = event.target.value; reload(); });
+  document.querySelector('#contactEngagement').addEventListener('change', (event) => { state.contactsEngagement = event.target.value; reload(); });
+  document.querySelector('#contactSort').addEventListener('change', (event) => { state.contactsSort = event.target.value; reload(); });
+  document.querySelector('#contactDirection').addEventListener('click', () => {
+    state.contactsDirection = state.contactsDirection === 'asc' ? 'desc' : 'asc';
+    reload();
+  });
+
+  content.querySelectorAll('input[name="filterTag"]').forEach((box) => {
+    box.addEventListener('change', () => {
+      state.contactsTags = [...content.querySelectorAll('input[name="filterTag"]:checked')].map((node) => node.value);
+      reload();
+    });
+  });
+  document.querySelector('#tagMatchToggle')?.addEventListener('click', () => {
+    state.contactsTagMatch = state.contactsTagMatch === 'all' ? 'any' : 'all';
+    reload();
+  });
+  document.querySelector('#clearTags')?.addEventListener('click', () => { state.contactsTags = []; reload(); });
+
+  document.querySelector('#selectAll').addEventListener('change', (event) => {
+    for (const row of data.rows) {
+      if (event.target.checked) state.contactsSelection.add(row.id);
+      else state.contactsSelection.delete(row.id);
+    }
+    renderContacts();
+  });
+  content.querySelectorAll('input[name="selectContact"]').forEach((box) => {
+    box.addEventListener('change', () => {
+      if (box.checked) state.contactsSelection.add(box.value);
+      else state.contactsSelection.delete(box.value);
+      renderContacts();
+    });
+  });
+
+  document.querySelector('#clearSelection')?.addEventListener('click', () => { state.contactsSelection.clear(); renderContacts(); });
+  document.querySelector('#bulkTagAdd')?.addEventListener('click', () => applyBulkTag('add'));
+  document.querySelector('#bulkTagRemove')?.addEventListener('click', () => applyBulkTag('remove'));
+}
+
+async function applyBulkTag(action) {
+  const tagId = document.querySelector('#bulkTag')?.value;
+  if (!tagId) { toast('Choose a tag first', 'Select which tag to apply.', 'warning'); return; }
+
+  const contactIds = [...state.contactsSelection];
+  try {
+    await api('/api/contacts/bulk-tag', { method: 'POST', body: { contactIds, tagIds: [tagId], action } });
+    toast(action === 'add' ? 'Tag applied' : 'Tag removed', `${contactIds.length} contact${contactIds.length === 1 ? '' : 's'} updated.`, 'success');
+    state.contactsSelection.clear();
+    await renderContacts();
+  } catch (error) {
+    toast('Could not update tags', error.message || String(error), 'error');
+  }
 }
 
 async function renderCampaigns() {

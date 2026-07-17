@@ -9,10 +9,11 @@ async function createCampaign(request: Request, env: Env): Promise<Response> {
   const campaign = normalizeCampaign(body);
   await validateCampaignReferences(env, campaign.audienceId, campaign.senderId);
   await env.DB.prepare(`
-    INSERT INTO campaigns (id, name, audience_id, sender_id, subject, preview_text, html_body, text_body, filter_tags_json, status, scheduled_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+    INSERT INTO campaigns (id, name, audience_id, sender_id, subject, preview_text, html_body, text_body, filter_tags_json, status, scheduled_at, track_opens, track_clicks)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)
   `).bind(id, campaign.name, campaign.audienceId, campaign.senderId, campaign.subject, campaign.previewText,
-    campaign.htmlBody, campaign.textBody, JSON.stringify(campaign.filterTagIds), campaign.scheduledAt).run();
+    campaign.htmlBody, campaign.textBody, JSON.stringify(campaign.filterTagIds), campaign.scheduledAt,
+    campaign.trackOpens, campaign.trackClicks).run();
   return json({ id, ...campaign, status: "draft" }, 201);
 }
 
@@ -32,15 +33,19 @@ async function updateCampaign(request: Request, env: Env, id: string): Promise<R
     htmlBody: body.htmlBody ?? existing.html_body,
     textBody: body.textBody ?? existing.text_body,
     filterTagIds: body.filterTagIds ?? parseJsonArray(String(existing.filter_tags_json ?? "[]")),
-    scheduledAt: body.scheduledAt ?? existing.scheduled_at
+    scheduledAt: body.scheduledAt ?? existing.scheduled_at,
+    trackOpens: body.trackOpens ?? body.track_opens ?? existing.track_opens,
+    trackClicks: body.trackClicks ?? body.track_clicks ?? existing.track_clicks
   };
   const campaign = normalizeCampaign(merged);
   await validateCampaignReferences(env, campaign.audienceId, campaign.senderId);
   await env.DB.prepare(`
     UPDATE campaigns SET name = ?, audience_id = ?, sender_id = ?, subject = ?, preview_text = ?, html_body = ?,
-      text_body = ?, filter_tags_json = ?, scheduled_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+      text_body = ?, filter_tags_json = ?, scheduled_at = ?, track_opens = ?, track_clicks = ?,
+      updated_at = CURRENT_TIMESTAMP WHERE id = ?
   `).bind(campaign.name, campaign.audienceId, campaign.senderId, campaign.subject, campaign.previewText,
-    campaign.htmlBody, campaign.textBody, JSON.stringify(campaign.filterTagIds), campaign.scheduledAt, id).run();
+    campaign.htmlBody, campaign.textBody, JSON.stringify(campaign.filterTagIds), campaign.scheduledAt,
+    campaign.trackOpens, campaign.trackClicks, id).run();
   return json({ id, ...campaign, status: existing.status });
 }
 
@@ -174,6 +179,10 @@ async function dispatchPendingRecipients(env: Env): Promise<void> {
     LIMIT ?
   `).bind(limit).all<{ id: string; campaign_id: string }>();
   if (!result.results.length) return;
+
+  // Register links once per campaign here rather than per recipient, so delivery
+  // only ever reads them.
+  await registerLinksForCampaigns(env, [...new Set(result.results.map((row) => row.campaign_id))]);
 
   const updateQueued = env.DB.prepare("UPDATE campaign_recipients SET status = 'queued', queued_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'");
   const resetPending = env.DB.prepare("UPDATE campaign_recipients SET status = 'pending', queued_at = NULL WHERE id = ? AND status = 'queued'");

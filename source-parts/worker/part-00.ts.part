@@ -49,6 +49,11 @@ export default {
       return handleUnsubscribe(request, env, url);
     }
 
+    // Tracking endpoints are reached by mail clients, so they must stay outside
+    // Access. They authenticate the signed token in the URL instead.
+    if (url.pathname === "/t/o") return handleTrackingOpen(request, env, url);
+    if (url.pathname === "/t/c") return handleTrackingClick(request, env, url);
+
     if (!url.pathname.startsWith("/api/")) {
       return withSecurityHeaders(await env.ASSETS.fetch(request));
     }
@@ -222,6 +227,7 @@ async function route(routeContext: RouteContext, actor: string): Promise<Respons
     return json({ actor, appName: env.APP_NAME ?? "PartnerMarket Global Mailer" });
   }
   if (method === "GET" && path === "/api/dashboard") return dashboard(env);
+  if (method === "GET" && path === "/api/analytics") return analyticsOverview(env, url);
 
   if (path === "/api/audiences" && method === "GET") return listAudiences(env);
   if (path === "/api/audiences" && method === "POST") return createAudience(request, env);
@@ -237,6 +243,10 @@ async function route(routeContext: RouteContext, actor: string): Promise<Respons
     if (method === "DELETE") return deleteContact(env, routeContext.params.id);
   }
   if (path === "/api/contacts/export" && method === "GET") return exportContacts(env, url);
+  if (path === "/api/contacts/bulk-tag" && method === "POST") return bulkTagContacts(request, env);
+  if (matchPath(path, "/api/contacts/:id/activity", routeContext.params) && method === "GET") {
+    return contactActivity(env, routeContext.params.id);
+  }
 
   if (path === "/api/imports/preview" && method === "POST") return previewImport(request, env);
   if (path === "/api/imports/commit" && method === "POST") return commitImport(request, env);
@@ -266,6 +276,9 @@ async function route(routeContext: RouteContext, actor: string): Promise<Respons
   }
   if (matchPath(path, "/api/campaigns/:id/recipients", routeContext.params) && method === "GET") {
     return listCampaignRecipients(env, routeContext.params.id, url);
+  }
+  if (matchPath(path, "/api/campaigns/:id/analytics", routeContext.params) && method === "GET") {
+    return campaignAnalytics(env, routeContext.params.id);
   }
   if (matchPath(path, "/api/campaigns/:id", routeContext.params)) {
     if (method === "GET") return getCampaign(env, routeContext.params.id);

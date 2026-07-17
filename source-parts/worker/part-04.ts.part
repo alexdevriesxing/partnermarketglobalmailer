@@ -20,6 +20,7 @@ async function deliverRecipient(message: Message<SendJob>, env: Env): Promise<vo
 
   const row = await env.DB.prepare(`
     SELECT cr.*, c.name AS campaign_name, c.subject, c.preview_text, c.html_body, c.text_body, c.status AS campaign_status,
+      c.track_opens, c.track_clicks,
       ct.first_name, ct.last_name, ct.company, ct.job_title, ct.country, ct.phone, ct.custom_json,
       s.name AS sender_name, s.email AS sender_email, s.reply_to, s.status AS sender_status
     FROM campaign_recipients cr
@@ -68,7 +69,20 @@ async function deliverRecipient(message: Message<SendJob>, env: Env): Promise<vo
       unsubscribe_url: unsubscribeUrl,
       ...parseJsonObject(String(row.custom_json ?? "{}"))
     };
-    const html = ensureUnsubscribeFooter(sanitizeEmailHtml(mergeHtml(String(row.html_body), mergeData)), unsubscribeUrl);
+    const trackOpens = Boolean(Number(row.track_opens ?? 1));
+    const trackClicks = Boolean(Number(row.track_clicks ?? 1));
+    const merged = ensureUnsubscribeFooter(sanitizeEmailHtml(mergeHtml(String(row.html_body), mergeData)), unsubscribeUrl);
+    // Tracking is applied after sanitising and after the unsubscribe footer, so
+    // the pixel and rewritten links survive both steps.
+    const html = trackOpens || trackClicks
+      ? await applyTracking(env, merged, {
+          campaignId: String(row.campaign_id),
+          contactId: String(row.contact_id),
+          links: trackClicks ? await loadCampaignLinks(env, String(row.campaign_id)) : new Map(),
+          trackOpens,
+          trackClicks
+        })
+      : merged;
     const text = ensureTextUnsubscribe(mergeText(String(row.text_body || stripHtml(String(row.html_body))), mergeData), unsubscribeUrl);
     const subject = mergeText(String(row.subject), mergeData).slice(0, 998);
 

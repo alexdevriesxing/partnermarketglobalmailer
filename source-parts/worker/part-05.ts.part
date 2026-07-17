@@ -58,7 +58,7 @@ function normalizeContact(body: Row): {
 
 function normalizeCampaign(body: Row): {
   name: string; audienceId: string; senderId: string; subject: string; previewText: string; htmlBody: string;
-  textBody: string; filterTagIds: string[]; scheduledAt: string | null;
+  textBody: string; filterTagIds: string[]; scheduledAt: string | null; trackOpens: number; trackClicks: number;
 } {
   const htmlBody = optionalString(body.htmlBody ?? body.html_body, 500_000);
   const textBody = optionalString(body.textBody ?? body.text_body, 200_000);
@@ -72,8 +72,18 @@ function normalizeCampaign(body: Row): {
     htmlBody,
     textBody,
     filterTagIds: arrayOfStrings(body.filterTagIds ?? body.filter_tags).slice(0, 50),
-    scheduledAt: body.scheduledAt || body.scheduled_at ? normalizeDateTime(body.scheduledAt ?? body.scheduled_at) : null
+    scheduledAt: body.scheduledAt || body.scheduled_at ? normalizeDateTime(body.scheduledAt ?? body.scheduled_at) : null,
+    trackOpens: booleanFlag(body.trackOpens ?? body.track_opens, true),
+    trackClicks: booleanFlag(body.trackClicks ?? body.track_clicks, true)
   };
+}
+
+// Tracking defaults to on, so only an explicit false turns it off.
+function booleanFlag(value: unknown, fallback: boolean): number {
+  if (value === undefined || value === null || value === "") return fallback ? 1 : 0;
+  if (typeof value === "boolean") return value ? 1 : 0;
+  if (typeof value === "number") return value ? 1 : 0;
+  return ["true", "1", "yes", "on"].includes(String(value).toLowerCase()) ? 1 : 0;
 }
 
 function normalizeDateTime(value: unknown): string {

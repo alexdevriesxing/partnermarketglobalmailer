@@ -66,11 +66,55 @@ async function deleteAudience(env: Env, id: string): Promise<Response> {
   return json({ ok: true });
 }
 
+// Sort keys are mapped to fixed SQL rather than interpolated, so an arbitrary
+// ?sort= value can never reach the query.
+const CONTACT_SORTS: Record<string, string> = {
+  created_at: "c.created_at",
+  updated_at: "c.updated_at",
+  email: "c.email COLLATE NOCASE",
+  first_name: "c.first_name COLLATE NOCASE",
+  last_name: "c.last_name COLLATE NOCASE",
+  company: "c.company COLLATE NOCASE",
+  country: "c.country COLLATE NOCASE",
+  status: "c.status",
+  last_engaged_at: "last_engaged_at",
+  opened_campaigns: "opened_campaigns",
+  clicked_campaigns: "clicked_campaigns"
+};
+
+const ENGAGED_EXISTS = "SELECT 1 FROM events e2 WHERE e2.contact_id = c.id AND e2.type IN ('open', 'click')";
+const SENT_EXISTS = "SELECT 1 FROM events e2 WHERE e2.contact_id = c.id AND e2.type = 'sent'";
+
+function contactEngagementClause(engagement: string): string | null {
+  switch (engagement) {
+    case "opened":
+      return `EXISTS (${ENGAGED_EXISTS})`;
+    case "clicked":
+      return "EXISTS (SELECT 1 FROM events e2 WHERE e2.contact_id = c.id AND e2.type = 'click')";
+    // Received something but never engaged: the audience worth a resend.
+    case "not_opened":
+      return `EXISTS (${SENT_EXISTS}) AND NOT EXISTS (${ENGAGED_EXISTS})`;
+    case "never_contacted":
+      return `NOT EXISTS (${SENT_EXISTS})`;
+    default:
+      return null;
+  }
+}
+
 async function listContacts(env: Env, url: URL): Promise<Response> {
   const audienceId = url.searchParams.get("audience_id") ?? "";
   const search = (url.searchParams.get("search") ?? "").trim();
-  const tagId = url.searchParams.get("tag_id") ?? "";
   const status = url.searchParams.get("status") ?? "";
+  const engagement = url.searchParams.get("engagement") ?? "";
+  const tagMatch = (url.searchParams.get("tag_match") ?? "any").toLowerCase() === "all" ? "all" : "any";
+  const tagIds = (url.searchParams.get("tag_ids") ?? url.searchParams.get("tag_id") ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .slice(0, 25);
+  const sortKey = url.searchParams.get("sort") ?? "created_at";
+  const sortColumn = CONTACT_SORTS[sortKey] ?? CONTACT_SORTS.created_at;
+  const direction = (url.searchParams.get("direction") ?? "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
   const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));
   const pageSize = Math.min(100, Math.max(10, Number(url.searchParams.get("page_size") ?? 50)));
   const offset = (page - 1) * pageSize;
@@ -84,30 +128,101 @@ async function listContacts(env: Env, url: URL): Promise<Response> {
     const needle = `%${search.slice(0, 50)}%`;
     bindings.push(needle, needle, needle, needle, needle);
   }
-  if (tagId) {
-    clauses.push("EXISTS (SELECT 1 FROM contact_tags ct2 WHERE ct2.contact_id = c.id AND ct2.tag_id = ?)");
-    bindings.push(tagId);
+  if (tagIds.length) {
+    if (tagMatch === "all") {
+      // Every tag must be present, so one EXISTS per tag.
+      for (const tagId of tagIds) {
+        clauses.push("EXISTS (SELECT 1 FROM contact_tags ct2 WHERE ct2.contact_id = c.id AND ct2.tag_id = ?)");
+        bindings.push(tagId);
+      }
+    } else {
+      clauses.push(`EXISTS (SELECT 1 FROM contact_tags ct2 WHERE ct2.contact_id = c.id AND ct2.tag_id IN (${tagIds.map(() => "?").join(", ")}))`);
+      bindings.push(...tagIds);
+    }
   }
+  const engagementClause = contactEngagementClause(engagement);
+  if (engagementClause) clauses.push(engagementClause);
 
   const where = clauses.join(" AND ");
   const [rows, count] = await Promise.all([
     env.DB.prepare(`
       SELECT c.*, a.name AS audience_name,
         COALESCE(GROUP_CONCAT(t.name, ', '), '') AS tags,
-        COALESCE(GROUP_CONCAT(t.id, ','), '') AS tag_ids
+        COALESCE(GROUP_CONCAT(t.id, ','), '') AS tag_ids,
+        (SELECT MAX(e.created_at) FROM events e WHERE e.contact_id = c.id AND e.type IN ('open', 'click')) AS last_engaged_at,
+        (SELECT COUNT(DISTINCT e.campaign_id) FROM events e WHERE e.contact_id = c.id AND e.type IN ('open', 'click')) AS opened_campaigns,
+        (SELECT COUNT(DISTINCT e.campaign_id) FROM events e WHERE e.contact_id = c.id AND e.type = 'click') AS clicked_campaigns,
+        (SELECT COUNT(DISTINCT e.campaign_id) FROM events e WHERE e.contact_id = c.id AND e.type = 'sent') AS received_campaigns
       FROM contacts c
       JOIN audiences a ON a.id = c.audience_id
       LEFT JOIN contact_tags ct ON ct.contact_id = c.id
       LEFT JOIN tags t ON t.id = ct.tag_id
       WHERE ${where}
       GROUP BY c.id
-      ORDER BY c.created_at DESC
+      ORDER BY ${sortColumn} ${direction}
       LIMIT ? OFFSET ?
     `).bind(...bindings, pageSize, offset).all(),
     env.DB.prepare(`SELECT COUNT(*) AS count FROM contacts c WHERE ${where}`).bind(...bindings).first<{ count: number }>()
   ]);
 
-  return json({ rows: rows.results, total: Number(count?.count ?? 0), page, pageSize });
+  return json({
+    rows: rows.results,
+    total: Number(count?.count ?? 0),
+    page,
+    pageSize,
+    sort: sortKey in CONTACT_SORTS ? sortKey : "created_at",
+    direction: direction.toLowerCase()
+  });
+}
+
+// Bulk tagging is what makes the tag list usable as a CRM: filter to a segment,
+// select it, tag it in one call.
+async function bulkTagContacts(request: Request, env: Env): Promise<Response> {
+  const body = await readJson(request);
+  // Capped so one request cannot fan out into thousands of statements and run
+  // the Worker out of CPU time mid-write.
+  // Deduplicated so repeated ids cannot inflate the statement count, and so the
+  // existence check below compares like with like.
+  const contactIds = [...new Set(arrayOfStrings(body.contactIds ?? body.contact_ids))];
+  const tagIds = [...new Set(arrayOfStrings(body.tagIds ?? body.tag_ids))];
+  const action = String(body.action ?? "add").toLowerCase();
+
+  if (!contactIds.length) throw new HttpError(400, "Select at least one contact.");
+  if (!tagIds.length) throw new HttpError(400, "Select at least one tag.");
+  if (contactIds.length > 250) throw new HttpError(400, "Tag at most 250 contacts at a time.");
+  if (tagIds.length > 10) throw new HttpError(400, "Apply at most 10 tags at a time.");
+  if (!["add", "remove"].includes(action)) throw new HttpError(400, "Action must be add or remove.");
+
+  // INSERT OR IGNORE swallows duplicate keys but not foreign key violations, so a
+  // stale id from the client would otherwise surface as a raw D1 error in a 500.
+  await assertRowsExist(env, "contacts", contactIds, "One or more selected contacts no longer exist.");
+  await assertRowsExist(env, "tags", tagIds, "One or more selected tags no longer exist.");
+
+  const statements = [];
+  for (const contactId of contactIds) {
+    for (const tagId of tagIds) {
+      statements.push(
+        action === "add"
+          ? env.DB.prepare("INSERT OR IGNORE INTO contact_tags (contact_id, tag_id) VALUES (?, ?)").bind(contactId, tagId)
+          : env.DB.prepare("DELETE FROM contact_tags WHERE contact_id = ? AND tag_id = ?").bind(contactId, tagId)
+      );
+    }
+  }
+
+  // D1 caps how much one batch can carry, so large selections go in chunks.
+  for (let index = 0; index < statements.length; index += 100) {
+    await env.DB.batch(statements.slice(index, index + 100));
+  }
+
+  return json({ ok: true, contacts: contactIds.length, tags: tagIds.length, action });
+}
+
+// Table names here are always literals from calling code, never user input.
+async function assertRowsExist(env: Env, table: "contacts" | "tags", ids: string[], message: string): Promise<void> {
+  const found = await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE id IN (${ids.map(() => "?").join(", ")})`)
+    .bind(...ids)
+    .first<{ count: number }>();
+  if (Number(found?.count ?? 0) !== ids.length) throw new HttpError(400, message);
 }
 
 async function createContact(request: Request, env: Env): Promise<Response> {
